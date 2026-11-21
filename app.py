@@ -42,26 +42,26 @@ MAX_DOC_CHARS = 1050
 
 SYSTEM_PROMPT = """You are a Sapaad Customer Support email assistant. Your job is to draft customer replies, refine rough drafts, and write internal Groove ticket notes using the provided Sapaad Knowledge Base (KB) and historical Groove Support Tickets as your primary references.
 
-1. SOURCE PRIORITY & ACCURACY
-- Always ground your answer in the provided REFERENCE CONTEXT. Never invent Sapaad features, menu paths, buttons, API-key workflows, pricing, or policies.
+1. SOURCE PRIORITY & ACCURACY (HIGHEST PRIORITY — NEVER COMPROMISE)
+- Always ground your answer in the provided REFERENCE CONTEXT. Never invent Sapaad features, menu paths, buttons, API-key workflows, third-party provider names, pricing, or policies.
+- Factual accuracy ALWAYS overrides self-service preferences: even if the agent asks to let the customer configure everything alone, NEVER invent steps, API keys, or menu paths that do not exist in the REFERENCE CONTEXT. If a feature is an optional add-on, not self-service, or not supported via open API, state that clearly and honestly.
 - Prioritize Sapaad KB articles for official step-by-step navigation paths and product rules.
 - Use historical Groove tickets for real-world edge cases, troubleshooting workarounds, policy clarifications (e.g., Guest Checkout, no custom open delivery API), and Sapaad's standard support phrasing.
 - Prioritize recent tickets (2025–2026) over older tickets (2023–2024). Always recommend AnyDesk (never TeamViewer) if remote support is needed, and use prints.sapaad.com/getcpa for Cloud Print Agent.
-- NEVER invent or guess Sapaad menu paths, settings, or button names. ONLY include a menu path if it explicitly appears in the REFERENCE CONTEXT.
-- If a KB article mentions a prerequisite (such as "add a surcharge called Delivery Fee") without specifying its menu path, state the prerequisite plainly as written—NEVER guess a path for it.
-- Never invent extra technical actions (such as "generate API keys" inside Sapaad Connect) unless explicitly stated in the REFERENCE CONTEXT.
+- NEVER invent or guess Sapaad menu paths, settings, or button names. ONLY write a ">" menu path if that exact path appears in the REFERENCE CONTEXT.
+- If a KB article mentions a prerequisite (such as "add a surcharge called Delivery Fee") without giving its menu path, state the prerequisite plainly WITHOUT adding any ">" menu path to it.
 - Never assume the customer is on a limited plan (such as Sapaad Direct Lite) unless the customer explicitly mentions it; provide the standard setup steps first and only mention plan differences as a brief note if relevant.
 - Always keep Sapaad UI menu paths and product names in clean, exact English (e.g., Setup > Sapaad Add-Ons > Sapaad Direct) even when replying in Arabic, and NEVER mix English and Arabic letters inside the same word.
 - Whenever providing Sapaad.Online configuration steps (delivery areas, delivery fees, scheduled orders, payment methods, timings, or menu changes), remind the customer to sync changes via: Setup > Sapaad Add-Ons > Sapaad.Online Settings > Synchronize > Save.
 
 2. AGENT INSTRUCTIONS & MISSING INFO HANDLING
-- AGENT INSTRUCTIONS ALWAYS OVERRIDE DEFAULT WORKFLOW BEHAVIOR. For example, if the agent instructs you NOT to schedule a meeting, NOT to offer AnyDesk, or NOT to promise checking/reviewing the customer's account, you MUST obey strictly—never promise to check their account, review settings, or get back to them.
-- NEVER expose, quote, or mirror internal Agent Instructions harshly to the customer (for example, NEVER tell a customer "without needing any meeting or review from our side"). Keep the customer-facing tone warm, helpful, and natural.
+- Follow AGENT INSTRUCTIONS strictly for workflow decisions (e.g., do NOT schedule a meeting, do NOT offer AnyDesk, and do NOT promise checking/reviewing the customer's account if the agent instructs against it).
+- NEVER expose, quote, or mirror internal Agent Instructions harshly to the customer (never say "without needing any meeting or review from our side"). Keep the customer-facing tone warm, helpful, and natural.
 - If a specific point is NOT covered in the REFERENCE CONTEXT:
-  * Never invent or guess a menu path.
+  * Never invent or guess a menu path or technical workflow (such as API keys).
   * If the agent gave no restriction, politely state that we can check their account settings or review it together.
-  * If the agent instructed you to let the customer self-serve without promising a review or meeting, state concisely what is available or not supported without guessing fake menus or promising manual follow-up—and flag the missing detail inside a short "[Agent Note: ...]" line at the very top of your output (which the UI automatically hides from the copyable email).
-- Write "[Agent Note: ...]" strictly as an internal note to the support agent (never address the customer inside the Agent Note). Only include it if something genuinely needs the agent's attention.
+  * If the agent instructed you not to promise a review or meeting, state concisely what is supported or requires an add-on/partner integration without guessing fake steps, and flag the gap inside a short "[Agent Note: ...]" line at the very top of your output (the UI hides this automatically from the copyable email).
+- Write "[Agent Note: ...]" strictly as an internal note to the support agent (never address the customer inside it). Only include it if something genuinely needs the agent's attention.
 
 3. PRIVACY & PLACEHOLDER SAFETY
 - NEVER copy redacted placeholders ([PHONE_OR_ID], [EMAIL]), other customers' names, restaurant names, passwords, or expired Zoom/WeTransfer links from past tickets into a new draft.
@@ -71,7 +71,9 @@ SYSTEM_PROMPT = """You are a Sapaad Customer Support email assistant. Your job i
 - Always write in the "we" tone (representing the Sapaad Support Team), polite, clear, and concise.
 - Match the requested or customer's language (English or Arabic).
 - For Arabic replies, ALWAYS use respectful plural addressing with accurate spelling in EVERY verb and step (e.g., افتحوا، اختاروا، انتقلوا، اضغطوا، ضعوا، حرّروا، احفظوا، كرروا). NEVER switch to singular verbs or misspell them (never write واختروا or اختر).
-- Greeting on its own line, followed by a blank line, then a brief 1-sentence polite opening line (e.g., "Thank you for reaching out. Here are the steps to configure each item:" or "نشكركم على تواصلكم معنا، فيما يلي خطوات إعداد ومراجعة كل نقطة من النقاط المطلوبة:") BEFORE starting numbered lists.
+- MANDATORY GREETING (Customer Emails Only): ALWAYS start line 1 with the greeting on its own line, followed by a blank line, THEN a brief 1-sentence polite opening line:
+  - English: "Dear [Customer Name]," or "Hi [Customer Name]," (or "Hi," if no name is provided)
+  - Arabic: "السلام عليكم،"
 - For multi-part customer inquiries, place each numbered heading on its own line ("1. Title"), followed by simple "- " bullet lines underneath, and leave a blank line between every numbered section. NEVER put "- " before a number.
 - Mandatory Closing (Customer Emails Only) on its own separate paragraph at the very end:
   - English:
@@ -161,6 +163,8 @@ def build_search_index():
     for filepath in sorted(glob.glob(os.path.join(data_dir, "*.md"))):
         filename = os.path.basename(filepath)
         is_ticket_file = filename.lower().startswith("tickets_")
+        # Give high-level subscription/overview blurbs a lower weight than step-by-step KB guides & 2025-2026 tickets
+        kb_weight = 1.05 if filename.lower() in {"subscription.md", "pricing.md"} else 1.40
 
         with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
             content = f.read()
@@ -222,7 +226,7 @@ def build_search_index():
                             "title": chunk_title,
                             "type": "KB",
                             "year": 2026,
-                            "weight": 1.40,
+                            "weight": kb_weight,
                             "text": f"KB Article: {chunk_title}\n{chunk}",
                             "search_text": f"{title} {title}\n{chunk}",
                         })
@@ -245,7 +249,7 @@ def build_search_index():
                             "title": chunk_title,
                             "type": "KB",
                             "year": 2026,
-                            "weight": 1.40,
+                            "weight": kb_weight,
                             "text": sub,
                             "search_text": f"{chunk_title} {chunk_title}\n{sub}",
                         })
@@ -282,7 +286,7 @@ def extract_english_subqueries(text: str, primary_model: str) -> tuple[list[str]
         "- OTP without WhatsApp / alternative OTP -> enable email OTP Sapaad Direct Sapaad Online\n"
         "- scheduled orders / advance orders -> Accept Scheduled Orders Sapaad.Online Make Arrangements\n"
         "- disable cash on delivery / pay at counter -> disable Pay at Counter Cash on Delivery Payment Types Sapaad Direct Sapaad.Online\n"
-        "- delivery API / delivery partner integration -> Sapaad Connect Logistics Partners delivery integration API\n"
+        "- delivery API / third party delivery integration -> open API third party delivery partner integration Sapaad Connect\n"
         "- delivery areas / map / country filter -> delivery areas Google Map Integration upload delivery areas\n"
         "- delivery fee per zone -> add surcharge Delivery Fee different delivery fee per area\n"
         "Output ONLY the complete English query lines—no Arabic, no numbering, no bullets, no explanations. Max 10 lines.\n\n"
@@ -406,27 +410,38 @@ def build_context_block(matches: list[dict]) -> str:
 
 
 # ================= GROQ LLM CALL & OUTPUT CLEANING =================
-def clean_for_groove(text: str) -> str:
-    """Strip stray Markdown symbols, fix mixed-script brand typos, and enforce clean Groove spacing."""
+def clean_for_groove(text: str, is_customer_email: bool = True) -> str:
+    """Strip Markdown symbols, fix minor typos, and enforce Groove-ready greeting & spacing."""
     text = text.replace("\r\n", "\n")
     text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
     text = re.sub(r"__(.*?)__", r"\1", text)
     text = re.sub(r"(?m)^#{1,6}\s+", "", text)
     text = re.sub(r"`([^`]+)`", r"\1", text)
-    # Fix rare LLM mixed-script typos like "Sapaاد" -> "Sapaad"
+    # Fix rare mixed-script brand typos & common Arabic verb typos
     text = re.sub(r"Sapa[\u0600-\u06FF]+", "Sapaad", text)
+    text = re.sub(r"\bواختروا\b", "واختاروا", text)
+    text = re.sub(r"\bاختروا\b", "اختاروا", text)
     # Remove any stray bullet glued before a numbered heading (e.g. "- 2. Title" -> "2. Title")
     text = re.sub(r"(?m)^[ \t]*-\s+(\d+\.\s+)", r"\1", text)
     # Guarantee a blank line before numbered headings
     text = re.sub(r"(?m)(?<!\n)\n(\d+\.\s+)", r"\n\n\1", text)
-    # Guarantee a blank line after the Arabic greeting
-    text = re.sub(r"^(السلام عليكم[،,]?)[ \t]*\n*", r"\1\n\n", text)
-    # Guarantee the mandatory closing sits cleanly on its own paragraph
-    for closing in (
-        "لا تترددوا بالتواصل معنا لأي مساعدة إضافية.",
-        "Please feel free to write to us for any further assistance.",
-    ):
-        text = re.sub(rf"\s*{re.escape(closing)}\s*$", f"\n\n{closing}", text)
+    text = text.strip()
+
+    if is_customer_email:
+        # Ensure Arabic customer emails always begin with السلام عليكم،
+        if re.search(r"[\u0600-\u06FF]", text):
+            if not re.match(r"^(السلام عليكم|مرحب[ااً]|عزيزي|السادة)", text):
+                text = f"السلام عليكم،\n\n{text}"
+            else:
+                text = re.sub(r"^(السلام عليكم[،,]?)[ \t]*\n*", r"\1\n\n", text)
+
+        # Guarantee the mandatory closing sits cleanly on its own paragraph
+        for closing in (
+            "لا تترددوا بالتواصل معنا لأي مساعدة إضافية.",
+            "Please feel free to write to us for any further assistance.",
+        ):
+            text = re.sub(rf"\s*{re.escape(closing)}\s*$", f"\n\n{closing}", text)
+
     text = re.sub(r"[ \t]+\n", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
@@ -436,7 +451,8 @@ def split_agent_note(text: str) -> tuple[str, str]:
     """Extract optional leading [Agent Note: ...] so it displays separately from the copyable email."""
     match = re.match(r"^\s*\[Agent Note:\s*(.*?)\]\s*\n+", text, flags=re.IGNORECASE | re.DOTALL)
     if match:
-        return match.group(1).strip(), text[match.end():].strip()
+        note = re.sub(r"\*\*(.*?)\*\*", r"\1", match.group(1)).strip()
+        return note, text[match.end():].strip()
     return "", text.strip()
 
 
@@ -452,7 +468,7 @@ def call_groq(model_id: str, user_prompt: str, temperature: float = 0.2) -> tupl
             temperature=temperature,
             max_tokens=2800,
         )
-        return clean_for_groove(resp.choices[0].message.content or ""), model_id
+        return (resp.choices[0].message.content or "").strip(), model_id
     except Exception as e:
         err_str = str(e).lower()
         if "429" in err_str or "413" in err_str or "rate_limit" in err_str:
@@ -470,7 +486,7 @@ def call_groq(model_id: str, user_prompt: str, temperature: float = 0.2) -> tupl
                         temperature=temperature,
                         max_tokens=2800,
                     )
-                    return clean_for_groove(resp.choices[0].message.content or ""), f"{retry_model} (fallback)"
+                    return (resp.choices[0].message.content or "").strip(), f"{retry_model} (fallback)"
                 except Exception as retry_e:
                     last_err = retry_e
             raise last_err
@@ -590,7 +606,7 @@ with col2:
                         f"TASK: Draft a ready-to-send Sapaad Support email reply.\n"
                         f"LANGUAGE: {lang_rule}\n\n"
                         f"CUSTOMER EMAIL:\n{customer_email}\n\n"
-                        f"AGENT INSTRUCTIONS (HIGHEST PRIORITY — follow strictly, without exposing internal instructions verbatim to the customer):\n{agent_notes or 'None'}\n\n"
+                        f"AGENT INSTRUCTIONS (follow strictly for workflow, without inventing paths/features or exposing internal instructions verbatim):\n{agent_notes or 'None'}\n\n"
                         f"REFERENCE CONTEXT (Sapaad KB & Past Resolved Tickets):\n{context_block or 'No matching context found.'}"
                     )
                 elif mode == "Refine Draft":
@@ -618,7 +634,10 @@ with col2:
 
                 try:
                     raw_output, used_model = call_groq(MODELS[model_label], prompt)
-                    agent_note, clean_email = split_agent_note(raw_output)
+                    agent_note, body_text = split_agent_note(raw_output)
+                    clean_email = clean_for_groove(
+                        body_text, is_customer_email=(mode != "Internal Note / Summary")
+                    )
                     st.session_state.last_agent_note = agent_note
                     st.session_state.last_output = clean_email
                     st.session_state.last_model = used_model
