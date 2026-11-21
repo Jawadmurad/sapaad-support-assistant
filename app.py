@@ -24,11 +24,6 @@ GROQ_API_KEY = get_secret("GROQ_API_KEY")
 HF_TOKEN = get_secret("HF_TOKEN")
 HF_DATASET_REPO = get_secret("HF_DATASET_REPO")
 TEAM_PASSWORD = get_secret("TEAM_PASSWORD")
-
-GROQ_API_KEY = os.environ.get("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", "")
-HF_TOKEN = os.environ.get("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", "")
-HF_DATASET_REPO = os.environ.get("JawadMurad/sapaad-support-data", "")  # e.g. "yourname/sapaad-support-data"
-TEAM_PASSWORD = os.environ.get("$@paad2026", "")      # Shared password for colleagues
 LOCAL_DATA_DIR = "data"
 
 MODELS = {
