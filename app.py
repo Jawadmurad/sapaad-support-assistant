@@ -37,7 +37,7 @@ MODELS = {
 FALLBACK_MODEL = "llama-3.3-70b-versatile"
 
 # Token-safe limits for Groq Free Tier (8,000 TPM on GPT-OSS models)
-MAX_CONTEXT_CHARS = 10500
+MAX_CONTEXT_CHARS = 10800
 MAX_DOC_CHARS = 1050
 
 SYSTEM_PROMPT = """You are a Sapaad Customer Support email assistant. Your job is to draft customer replies, refine rough drafts, and write internal Groove ticket notes using the provided Sapaad Knowledge Base (KB) and historical Groove Support Tickets as your primary references.
@@ -48,15 +48,16 @@ SYSTEM_PROMPT = """You are a Sapaad Customer Support email assistant. Your job i
 - Use historical Groove tickets for real-world edge cases, troubleshooting workarounds, policy clarifications (e.g., Guest Checkout, no custom open API), and Sapaad's standard support phrasing.
 - Prioritize recent tickets (2025–2026) over older tickets (2023–2024). Always recommend AnyDesk (never TeamViewer) if remote support is needed, and use prints.sapaad.com/getcpa for Cloud Print Agent.
 - NEVER invent or guess Sapaad menu paths, settings, or button names. ONLY include a menu path if it explicitly appears in the REFERENCE CONTEXT.
+- Never assume the customer is on a limited plan (such as Sapaad Direct Lite) unless the customer explicitly mentions it; provide the standard setup steps first and only mention plan differences as a brief note if relevant.
 - Always keep Sapaad UI menu paths in their original English (e.g., Setup > Location Setup > Self Ordering Systems > Sapaad Direct) even when replying in Arabic, because the Sapaad interface is in English.
 - Whenever providing Sapaad.Online configuration steps (delivery areas, delivery fees, scheduled orders, payment methods, timings, or menu changes), remind the customer to sync changes via: Setup > Sapaad Add-Ons > Sapaad.Online Settings > Synchronize > Save.
 
 2. AGENT INSTRUCTIONS & MISSING INFO HANDLING
 - AGENT INSTRUCTIONS ALWAYS OVERRIDE DEFAULT WORKFLOW BEHAVIOR. For example, if the agent instructs you NOT to schedule a meeting, NOT to offer AnyDesk, or NOT to promise checking/reviewing the customer's account, you MUST obey strictly—never promise to check their account, review settings, or get back to them.
 - If a specific point is NOT covered in the REFERENCE CONTEXT:
-  * Never invent a menu path.
+  * Never invent or guess a menu path.
   * If the agent gave no restriction, politely state that we can check their account settings or review it together.
-  * If the agent instructed you to let the customer self-serve without promising a review or meeting, state concisely and politely what is available/not supported based on standard Sapaad functionality, or ask the customer to verify that option in the relevant Sapaad module without promising manual intervention—and flag the missing detail inside a short "[Agent Note: ...]" line at the very top of your output (which the UI automatically hides from the copyable email).
+  * If the agent instructed you to let the customer self-serve without promising a review or meeting, state concisely what is available or not supported without guessing fake menus or promising manual follow-up—and flag the missing detail inside a short "[Agent Note: ...]" line at the very top of your output (which the UI automatically hides from the copyable email).
 - Write "[Agent Note: ...]" strictly as an internal note to the support agent (never address the customer inside the Agent Note). Only include it if something genuinely needs the agent's attention.
 
 3. PRIVACY & PLACEHOLDER SAFETY
@@ -66,14 +67,16 @@ SYSTEM_PROMPT = """You are a Sapaad Customer Support email assistant. Your job i
 4. TONE, LANGUAGE & FORMATTING
 - Always write in the "we" tone (representing the Sapaad Support Team), polite, clear, and concise.
 - Match the requested or customer's language (English or Arabic).
+- For Arabic replies, maintain consistent respectful plural addressing throughout (e.g., انتقلوا، اختاروا، قوموا، حرّروا، احفظوا) and ensure accurate Arabic spelling.
 - Greeting: Use "Dear [Customer Name]," or "Hi [Customer Name]," (use "Hi," if no name is provided; use "السلام عليكم،" for Arabic).
 - Mandatory Closing (Customer Emails Only):
   - English: End every customer email with exactly:
     Please feel free to write to us for any further assistance.
   - Arabic: End every customer email with exactly:
     لا تترددوا بالتواصل معنا لأي مساعدة إضافية.
+- NO duplicate closing sentence: Do NOT add another "contact us if you need anything" sentence right before the mandatory closing line.
 - NO sign-off or signature: Never add "Best regards,", "Thanks,", or an agent name at the bottom (Groove appends the signature automatically).
-- For multi-part customer inquiries, use clean numbered points (1., 2., 3.) so every single customer question is clearly answered.
+- For multi-part customer inquiries, use clean numbered points (1., 2., 3.) with consistent indentation (use simple "- " bullets directly under each numbered item).
 - PLAIN TEXT ONLY: Never use Markdown formatting. Do NOT use **bold**, *italics*, ### headers, or backticks. Use plain text, clean line breaks, and simple numbered lists (1., 2., 3.) or hyphens (-) so the output can be pasted directly into Groove.
 """
 
@@ -109,7 +112,6 @@ def chunk_long_text(text: str, max_chars: int = 1350, overlap: int = 200) -> lis
     while start < len(text):
         end = min(len(text), start + max_chars)
         if end < len(text):
-            # Prefer breaking at a newline or sentence boundary
             split_pos = text.rfind("\n", start + max_chars // 2, end)
             if split_pos == -1:
                 split_pos = text.rfind(". ", start + max_chars // 2, end)
@@ -168,7 +170,6 @@ def build_search_index():
                 if len(body) < 40:
                     continue
 
-                # Only index tickets that actually contain a Support Resolution
                 res_parts = re.split(r"\*{0,2}Support Resolution:\*{0,2}", body)
                 if len(res_parts) < 2:
                     continue
@@ -183,7 +184,6 @@ def build_search_index():
                 year = int(year_match.group(1)) if year_match else 2024
                 weight = 1.25 if year >= 2025 else 0.85
 
-                # Keep short customer issue + rich resolution so the answer is never truncated
                 llm_text = (
                     f"{header}\n"
                     f"Customer Issue: {cust_text[:300]}\n"
@@ -209,7 +209,6 @@ def build_search_index():
                     body = parts[i + 1].strip() if i + 1 < len(parts) else ""
                     if len(body) < 35:
                         continue
-                    # Skip file-level index metadata blocks so they don't waste search slots
                     if "Consolidated Knowledge Base documentation" in body and "Total Articles:" in body:
                         continue
 
@@ -259,32 +258,36 @@ def build_search_index():
 
 # ================= MULTI-TOPIC ENGLISH QUERY EXTRACTION =================
 def get_extractor_models(primary_model: str) -> list[str]:
-    """Use a DIFFERENT Groq model for query extraction to avoid colliding with the drafting TPM bucket."""
+    """Prefer non-reasoning Llama 3.3 70B first so query extraction never burns tokens on thinking."""
     candidates = ["llama-3.3-70b-versatile", "openai/gpt-oss-20b", "openai/gpt-oss-120b"]
     ordered = [m for m in candidates if m != primary_model] + [primary_model]
+    # Keep llama-3.3-70b-versatile first even if user picked it, unless it fails
+    if "llama-3.3-70b-versatile" in ordered:
+        ordered.remove("llama-3.3-70b-versatile")
+        ordered.insert(0, "llama-3.3-70b-versatile")
     return ordered
 
 
-def extract_english_subqueries(text: str, primary_model: str) -> list[str]:
+def extract_english_subqueries(text: str, primary_model: str) -> tuple[list[str], str]:
     """Translate and split any Arabic or English email into Sapaad-native English search queries."""
     client = Groq(api_key=GROQ_API_KEY)
     last_error = None
 
     extraction_prompt = (
         "You are a search query translator for Sapaad POS Knowledge Base & Support Tickets.\n"
-        "Read the customer email below (which may be in Arabic or English) and extract EVERY distinct "
-        "question or requirement as its OWN separate line (NEVER merge two different points into one line).\n"
+        "Read the customer email below (Arabic or English) and extract EVERY distinct question or requirement "
+        "as its OWN separate line (NEVER merge two different points into one line).\n"
         "Each line must be a short ENGLISH search query (3 to 7 keywords) mapped to exact Sapaad terminology:\n"
-        "- QR code / digital menu -> Sapaad Direct QR code setup table QR\n"
+        "- QR code setup / activation -> how to set up Sapaad Direct Generate QR Table QRs\n"
         "- waiter button / call waiter -> Enable Waiter Hailing Sapaad Direct Pro Open Tab\n"
         "- disable OTP / remove OTP / without OTP -> guest checkout Checkout Mode instead of OTP Sapaad Direct\n"
         "- OTP without WhatsApp / alternative OTP -> enable email OTP Sapaad Direct Sapaad Online\n"
         "- scheduled orders / advance orders -> Accept Scheduled Orders Sapaad.Online Make Arrangements\n"
-        "- disable cash on delivery / pay at counter -> disable Pay at Counter Cash on Delivery payment types Sapaad Direct Sapaad.Online\n"
-        "- delivery API / third party integration -> API integration third party standalone Sapaad Connect Logistics Partners UrbanPiper\n"
-        "- delivery areas / map / country filter -> delivery areas Google Map Integration upload delivery areas zone mapping\n"
+        "- disable cash on delivery / pay at counter -> disable Pay at Counter Cash on Delivery Payment Types Sapaad Direct Sapaad.Online\n"
+        "- delivery API / third party delivery integration -> API integration third party standalone Sapaad Connect Logistics Partners UrbanPiper\n"
+        "- delivery areas / map / country filter -> delivery areas Google Map Integration upload delivery areas\n"
         "- delivery fee per zone -> different delivery fee per area default delivery fee surcharge\n"
-        "Output ONLY the English query lines—no Arabic, no numbering, no bullets, no explanations. Max 10 lines.\n\n"
+        "Output ONLY the complete English query lines—no Arabic, no numbering, no bullets, no explanations. Max 10 lines.\n\n"
         f"{text[:2500]}"
     )
 
@@ -294,34 +297,35 @@ def extract_english_subqueries(text: str, primary_model: str) -> list[str]:
                 model=m,
                 messages=[{"role": "user", "content": extraction_prompt}],
                 temperature=0.0,
-                max_tokens=600,
+                max_tokens=2000,
             )
             raw = (resp.choices[0].message.content or "").strip()
             lines = []
             for ln in raw.splitlines():
                 cleaned = re.sub(r"^[\d\.\-\•\*\s]+", "", ln).strip()
-                if cleaned and re.search(r"[a-zA-Z]{2,}", cleaned):
+                # Require at least 2 words with English letters so truncated fragments like "disable" are discarded
+                if cleaned and len(cleaned.split()) >= 2 and re.search(r"[a-zA-Z]{2,}", cleaned):
                     lines.append(cleaned)
             if lines:
-                return lines[:10]
+                return lines[:10], m
         except Exception as e:
             last_error = e
 
     if last_error:
         st.warning(f"English query translation failed ({last_error}); falling back to original text.")
-    return [text]
+    return [text], "fallback-raw"
 
 
 def retrieve_context(bm25, docs, query: str, primary_model: str, top_k: int = 6):
     """Balanced per-topic retrieval: guarantees EVERY customer point gets its best KB or Ticket match."""
     if not bm25 or not query.strip():
-        return [], []
+        return [], [], ""
 
-    subqueries = extract_english_subqueries(query, primary_model)
+    subqueries, extractor_used = extract_english_subqueries(query, primary_model)
 
     selected = []
     seen_ids = set()
-    max_docs = max(top_k, min(12, len(subqueries) + 3))
+    max_docs = max(top_k, min(12, len(subqueries) + 2))
 
     per_query_ranked = []
     for q in subqueries:
@@ -383,15 +387,14 @@ def retrieve_context(bm25, docs, query: str, primary_model: str, top_k: int = 6)
             if len(selected) >= top_k:
                 break
 
-    return selected[:max_docs], subqueries
+    return selected[:max_docs], subqueries, extractor_used
 
 
 def build_context_block(matches: list[dict]) -> str:
     """Build a token-safe reference context block that never exceeds MAX_CONTEXT_CHARS."""
     if not matches:
         return ""
-    # Dynamically size per-doc budget so all topics fit even in a 9-10 point email
-    per_doc_limit = min(MAX_DOC_CHARS, max(700, MAX_CONTEXT_CHARS // max(1, len(matches))))
+    per_doc_limit = min(MAX_DOC_CHARS, max(750, MAX_CONTEXT_CHARS // max(1, len(matches))))
     parts = []
     total_chars = 0
     for m in matches:
@@ -407,12 +410,13 @@ def build_context_block(matches: list[dict]) -> str:
 
 # ================= GROQ LLM CALL & OUTPUT CLEANING =================
 def clean_for_groove(text: str) -> str:
-    """Strip any stray Markdown symbols so the draft is 100% plain-text ready for Groove."""
+    """Strip any stray Markdown symbols and normalize whitespace so the draft is 100% ready for Groove."""
     text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
     text = re.sub(r"__(.*?)__", r"\1", text)
     text = re.sub(r"(?m)^#{1,6}\s+", "", text)
     text = re.sub(r"`([^`]+)`", r"\1", text)
     text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
 
@@ -555,11 +559,11 @@ with col2:
             with st.spinner("Searching Sapaad KB & Tickets and generating..."):
                 search_source = customer_email.strip() or agent_notes.strip()
                 if mode != "Internal Note / Summary":
-                    matches, used_queries = retrieve_context(
+                    matches, used_queries, extractor_used = retrieve_context(
                         bm25, docs, search_source, MODELS[model_label], top_k=top_k
                     )
                 else:
-                    matches, used_queries = [], []
+                    matches, used_queries, extractor_used = [], [], ""
 
                 context_block = build_context_block(matches)
 
@@ -608,6 +612,7 @@ with col2:
                     st.session_state.last_model = used_model
                     st.session_state.last_matches = matches
                     st.session_state.last_queries = used_queries
+                    st.session_state.last_extractor = extractor_used
                 except Exception as e:
                     st.error(f"API Error: {e}")
 
@@ -622,7 +627,8 @@ with col2:
         if st.session_state.get("last_matches"):
             with st.expander(f"📚 Referenced Sources ({len(st.session_state.last_matches)})"):
                 if st.session_state.get("last_queries"):
-                    st.info("English search queries used: " + " | ".join(st.session_state.last_queries))
+                    ext_tag = f" ({st.session_state.get('last_extractor', '')})" if st.session_state.get("last_extractor") else ""
+                    st.info(f"English search queries used{ext_tag}: " + " | ".join(st.session_state.last_queries))
                 for m in st.session_state.last_matches:
                     topic_label = f" — *Matched: {m['matched_query']}*" if m.get("matched_query") else ""
                     st.markdown(f"**[{m['type']}] {m['title']}** *({m['source']})*{topic_label}")
