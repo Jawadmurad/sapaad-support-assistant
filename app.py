@@ -36,6 +36,10 @@ MODELS = {
 }
 FALLBACK_MODEL = "openai/gpt-oss-20b"
 
+# Keep total reference context safely under Groq's 8,000 TPM free-tier limit
+MAX_CONTEXT_CHARS = 11000
+MAX_DOC_CHARS = 1100
+
 SYSTEM_PROMPT = """You are a Sapaad Customer Support email assistant. Your job is to draft customer replies, refine rough drafts, and write internal Groove ticket notes using the provided Sapaad Knowledge Base (KB) and historical Groove Support Tickets as your primary references.
 
 1. SOURCE PRIORITY & ACCURACY
@@ -124,11 +128,12 @@ def build_search_index():
                     "type": "Ticket",
                     "year": year,
                     "weight": weight,
-                    "text": f"{header}\n{body[:2200]}",
+                    "text": f"{header}\n{body[:1800]}",
                 })
                 ticket_count += 1
         else:
-            parts = re.split(r"(?m)^#{3,4}\s+([^\n]+)", content)
+            # Try splitting KB files by Markdown headings (##, ###, ####)
+            parts = re.split(r"(?m)^#{2,4}\s+([^\n]+)", content)
             if len(parts) > 2:
                 for i in range(1, len(parts), 2):
                     title = parts[i].strip()
@@ -141,19 +146,38 @@ def build_search_index():
                         "type": "KB",
                         "year": 2026,
                         "weight": 1.40,
-                        "text": f"KB Article: {title}\n{body[:2500]}",
+                        "text": f"KB Article: {title}\n{body[:1800]}",
                     })
                     kb_count += 1
-            elif len(content.strip()) > 30:
-                docs.append({
-                    "source": filename,
-                    "title": filename,
-                    "type": "KB",
-                    "year": 2026,
-                    "weight": 1.40,
-                    "text": content[:2500],
-                })
-                kb_count += 1
+            else:
+                # Fallback: split by horizontal rules (---) or Source: URL blocks
+                chunks = re.split(r"(?m)^-{3,}\s*$", content)
+                added_any = False
+                for chunk in chunks:
+                    chunk = chunk.strip()
+                    if len(chunk) < 40:
+                        continue
+                    first_line = chunk.splitlines()[0].strip("#* ")
+                    docs.append({
+                        "source": filename,
+                        "title": first_line[:120] or filename,
+                        "type": "KB",
+                        "year": 2026,
+                        "weight": 1.40,
+                        "text": chunk[:1800],
+                    })
+                    kb_count += 1
+                    added_any = True
+                if not added_any and len(content.strip()) > 30:
+                    docs.append({
+                        "source": filename,
+                        "title": filename,
+                        "type": "KB",
+                        "year": 2026,
+                        "weight": 1.40,
+                        "text": content[:1800],
+                    })
+                    kb_count += 1
 
     if not docs:
         return None, [], 0, 0
@@ -204,7 +228,7 @@ def extract_english_subqueries(text: str, model_id: str) -> list[str]:
 
 
 def retrieve_context(bm25, docs, query: str, model_id: str, top_k: int = 6):
-    """Search English KB & Tickets per topic using round-robin so every point gets English matches."""
+    """Search English KB & Tickets per topic using round-robin, capped to stay within Groq TPM limits."""
     if not bm25 or not query.strip():
         return [], []
 
@@ -212,40 +236,44 @@ def retrieve_context(bm25, docs, query: str, model_id: str, top_k: int = 6):
 
     selected = []
     seen_ids = set()
-    max_docs = max(top_k, min(14, len(subqueries) * 2))
+    max_docs = max(top_k, min(10, len(subqueries) + 2))
 
-    # For each English topic, grab up to 1 top KB article + 1 top Ticket
+    # First pass: grab the best KB article for each topic
     for q in subqueries:
         tokens = tokenize(q)
         if not tokens:
             continue
         raw_scores = bm25.get_scores(tokens)
-        scored = [
-            (score * docs[idx]["weight"], idx)
-            for idx, score in enumerate(raw_scores)
-            if score > 0
-        ]
-        scored.sort(reverse=True)
-
-        kb_picked = False
-        ticket_picked = False
-        for _, idx in scored[:25]:
-            if idx in seen_ids:
-                continue
-            doc_type = docs[idx]["type"]
-            if doc_type == "KB" and not kb_picked:
+        scored = sorted(
+            [(score * docs[idx]["weight"], idx) for idx, score in enumerate(raw_scores) if score > 0],
+            reverse=True,
+        )
+        for _, idx in scored[:15]:
+            if idx not in seen_ids and docs[idx]["type"] == "KB":
                 selected.append(docs[idx])
                 seen_ids.add(idx)
-                kb_picked = True
-            elif doc_type == "Ticket" and not ticket_picked:
-                selected.append(docs[idx])
-                seen_ids.add(idx)
-                ticket_picked = True
-            if kb_picked and ticket_picked:
                 break
-
         if len(selected) >= max_docs:
             break
+
+    # Second pass: fill remaining slots with top matching Tickets per topic
+    if len(selected) < max_docs:
+        for q in subqueries:
+            tokens = tokenize(q)
+            if not tokens:
+                continue
+            raw_scores = bm25.get_scores(tokens)
+            scored = sorted(
+                [(score * docs[idx]["weight"], idx) for idx, score in enumerate(raw_scores) if score > 0],
+                reverse=True,
+            )
+            for _, idx in scored[:15]:
+                if idx not in seen_ids and docs[idx]["type"] == "Ticket":
+                    selected.append(docs[idx])
+                    seen_ids.add(idx)
+                    break
+            if len(selected) >= max_docs:
+                break
 
     # Backfill if fewer than top_k were found
     if len(selected) < top_k:
@@ -263,6 +291,20 @@ def retrieve_context(bm25, docs, query: str, model_id: str, top_k: int = 6):
                 break
 
     return selected[:max_docs], subqueries
+
+
+def build_context_block(matches: list[dict]) -> str:
+    """Build a token-safe reference context block that never exceeds MAX_CONTEXT_CHARS."""
+    parts = []
+    total_chars = 0
+    for m in matches:
+        snippet = m["text"][:MAX_DOC_CHARS]
+        block = f"[{m['type']} | {m['source']}]\n{snippet}"
+        if total_chars + len(block) > MAX_CONTEXT_CHARS:
+            break
+        parts.append(block)
+        total_chars += len(block) + 7
+    return "\n\n---\n\n".join(parts)
 
 
 # ================= GROQ LLM CALL =================
@@ -286,22 +328,26 @@ def call_groq(model_id: str, user_prompt: str, temperature: float = 0.25) -> tup
                 {"role": "user", "content": user_prompt},
             ],
             temperature=temperature,
-            max_tokens=1500,
+            max_tokens=3000,
         )
         return clean_for_groove(resp.choices[0].message.content), model_id
     except Exception as e:
-        if "429" in str(e) or "rate_limit" in str(e).lower():
-            if model_id != FALLBACK_MODEL:
-                resp = client.chat.completions.create(
-                    model=FALLBACK_MODEL,
-                    messages=[
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    temperature=temperature,
-                    max_tokens=1500,
-                )
-                return clean_for_groove(resp.choices[0].message.content), f"{FALLBACK_MODEL} (fallback)"
+        err_str = str(e).lower()
+        if "429" in err_str or "413" in err_str or "rate_limit" in err_str:
+            # Trim prompt slightly and retry on fallback model
+            trimmed_prompt = user_prompt[:12000]
+            retry_model = FALLBACK_MODEL if model_id != FALLBACK_MODEL else model_id
+            resp = client.chat.completions.create(
+                model=retry_model,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": trimmed_prompt},
+                ],
+                temperature=temperature,
+                max_tokens=3000,
+            )
+            label = f"{retry_model} (fallback)" if retry_model != model_id else f"{retry_model} (trimmed)"
+            return clean_for_groove(resp.choices[0].message.content), label
         raise
 
 
@@ -405,9 +451,7 @@ with col2:
                 else:
                     matches, used_queries = [], []
 
-                context_block = "\n\n---\n\n".join(
-                    f"[{m['type']} | {m['source']}]\n{m['text']}" for m in matches
-                )
+                context_block = build_context_block(matches)
 
                 lang_rule = (
                     "Match the customer's language (English or Arabic)."
