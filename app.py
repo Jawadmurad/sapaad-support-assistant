@@ -35,6 +35,7 @@ MODELS = {
     "GPT-OSS 20B (Ultra-Fast)": "openai/gpt-oss-20b",
 }
 FALLBACK_MODEL = "openai/gpt-oss-20b"
+QUERY_EXTRACTOR_MODEL = "llama-3.1-8b-instant"
 
 SYSTEM_PROMPT = """You are a Sapaad Customer Support email assistant. Your job is to draft customer replies, refine rough drafts, and write internal Groove ticket notes using the provided Sapaad Knowledge Base (KB) and historical Groove Support Tickets as your primary references.
 
@@ -164,41 +165,50 @@ def build_search_index():
 
 
 def extract_english_subqueries(text: str) -> list[str]:
-    """Break any Arabic or English email into focused English Sapaad search queries."""
+    """Translate and split any Arabic or English email into clean English Sapaad search queries."""
     try:
         client = Groq(api_key=GROQ_API_KEY)
         resp = client.chat.completions.create(
-            model=FALLBACK_MODEL,
+            model=QUERY_EXTRACTOR_MODEL,
             messages=[{
                 "role": "user",
                 "content": (
-                    "Extract each distinct Sapaad POS / Sapaad.Online / Sapaad Direct support topic "
-                    "from the email below as a short English search query (3-6 keywords per line). "
-                    "Output ONLY the lines, maximum 8 lines, no numbering or explanations.\n\n"
-                    f"{text[:2000]}"
+                    "You are a search query translator for Sapaad POS support documentation.\n"
+                    "Read the customer email below (which may be in Arabic or English) and extract each distinct "
+                    "support topic as a short ENGLISH search query (3 to 6 English keywords per line).\n"
+                    "Use standard Sapaad terms where relevant (e.g., Sapaad Direct, Sapaad.Online, QR code, "
+                    "waiter hailing, delivery zones, OTP, Email OTP, SMS, scheduled orders, cash on delivery, API).\n"
+                    "Output ONLY the English lines—no Arabic, no numbering, no bullets, no intro text. Max 8 lines.\n\n"
+                    f"{text[:2500]}"
                 ),
             }],
             temperature=0.0,
-            max_tokens=180,
+            max_tokens=200,
         )
-        lines = [ln.strip("-•0123456789. ") for ln in resp.choices[0].message.content.splitlines() if ln.strip()]
+        raw = (resp.choices[0].message.content or "").strip()
+        lines = []
+        for ln in raw.splitlines():
+            cleaned = re.sub(r"^[\d\.\-\•\*\s]+", "", ln).strip()
+            if cleaned and re.search(r"[a-zA-Z]{2,}", cleaned):
+                lines.append(cleaned)
         return lines[:8] if lines else [text]
     except Exception:
         return [text]
 
 
 def retrieve_context(bm25, docs, query: str, top_k: int = 6):
-    """Run BM25 across English sub-queries + original query so Arabic emails match English KB & tickets."""
+    """Search English KB & Tickets per topic using round-robin so every point gets English matches."""
     if not bm25 or not query.strip():
-        return []
+        return [], []
 
     subqueries = extract_english_subqueries(query)
-    all_queries = subqueries + [query]
 
-    best_per_doc = {}
-    per_query_limit = 2 if len(subqueries) > 1 else top_k
+    selected = []
+    seen_ids = set()
+    max_docs = max(top_k, min(14, len(subqueries) * 2))
 
-    for q in all_queries:
+    # For each English topic, grab up to 1 top KB article + 1 top Ticket
+    for q in subqueries:
         tokens = tokenize(q)
         if not tokens:
             continue
@@ -209,13 +219,43 @@ def retrieve_context(bm25, docs, query: str, top_k: int = 6):
             if score > 0
         ]
         scored.sort(reverse=True)
-        for weighted_score, idx in scored[:per_query_limit]:
-            if idx not in best_per_doc or weighted_score > best_per_doc[idx]:
-                best_per_doc[idx] = weighted_score
 
-    max_docs = max(top_k, min(12, len(subqueries) * 2))
-    ranked = sorted(best_per_doc.items(), key=lambda x: x[1], reverse=True)
-    return [docs[idx] for idx, _ in ranked[:max_docs]]
+        kb_picked = False
+        ticket_picked = False
+        for _, idx in scored[:25]:
+            if idx in seen_ids:
+                continue
+            doc_type = docs[idx]["type"]
+            if doc_type == "KB" and not kb_picked:
+                selected.append(docs[idx])
+                seen_ids.add(idx)
+                kb_picked = True
+            elif doc_type == "Ticket" and not ticket_picked:
+                selected.append(docs[idx])
+                seen_ids.add(idx)
+                ticket_picked = True
+            if kb_picked and ticket_picked:
+                break
+
+        if len(selected) >= max_docs:
+            break
+
+    # Backfill if fewer than top_k were found
+    if len(selected) < top_k:
+        combined_tokens = tokenize(" ".join(subqueries))
+        raw_scores = bm25.get_scores(combined_tokens)
+        scored = sorted(
+            [(score * docs[idx]["weight"], idx) for idx, score in enumerate(raw_scores) if score > 0],
+            reverse=True,
+        )
+        for _, idx in scored:
+            if idx not in seen_ids:
+                selected.append(docs[idx])
+                seen_ids.add(idx)
+            if len(selected) >= top_k:
+                break
+
+    return selected[:max_docs], subqueries
 
 
 # ================= GROQ LLM CALL =================
@@ -350,7 +390,11 @@ with col2:
             st.warning("Please enter an email or draft first.")
         else:
             with st.spinner("Searching Sapaad KB & Tickets and generating..."):
-                matches = retrieve_context(bm25, docs, search_query, top_k=top_k) if mode != "Internal Note / Summary" else []
+                if mode != "Internal Note / Summary":
+                    matches, used_queries = retrieve_context(bm25, docs, search_query, top_k=top_k)
+                else:
+                    matches, used_queries = [], []
+
                 context_block = "\n\n---\n\n".join(
                     f"[{m['type']} | {m['source']}]\n{m['text']}" for m in matches
                 )
@@ -397,6 +441,7 @@ with col2:
                     st.session_state.last_output = output
                     st.session_state.last_model = used_model
                     st.session_state.last_matches = matches
+                    st.session_state.last_queries = used_queries
                 except Exception as e:
                     st.error(f"API Error: {e}")
 
@@ -407,6 +452,8 @@ with col2:
 
         if st.session_state.get("last_matches"):
             with st.expander(f"📚 Referenced Sources ({len(st.session_state.last_matches)})"):
+                if st.session_state.get("last_queries"):
+                    st.info("English search queries used: " + " | ".join(st.session_state.last_queries))
                 for m in st.session_state.last_matches:
                     st.markdown(f"**[{m['type']}] {m['title']}** *({m['source']})*")
                     st.caption(m["text"][:450] + "...")
