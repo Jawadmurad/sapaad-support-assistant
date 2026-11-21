@@ -12,6 +12,8 @@ st.set_page_config(
     page_icon="📩",
     layout="wide",
 )
+
+
 def get_secret(name: str, default: str = "") -> str:
     try:
         if name in st.secrets:
@@ -19,7 +21,8 @@ def get_secret(name: str, default: str = "") -> str:
     except Exception:
         pass
     return os.environ.get(name, default)
-    
+
+
 GROQ_API_KEY = get_secret("GROQ_API_KEY")
 HF_TOKEN = get_secret("HF_TOKEN")
 HF_DATASET_REPO = get_secret("HF_DATASET_REPO")
@@ -54,9 +57,9 @@ SYSTEM_PROMPT = """You are a Sapaad Customer Support email assistant. Your job i
 - Match the requested or customer's language (English or Arabic).
 - Greeting: Use "Dear [Customer Name]," or "Hi [Customer Name]," (use "Hi," if no name is provided; use "السلام عليكم،" for Arabic).
 - Mandatory Closing (Customer Emails Only):
-  * English: End every customer email with exactly:
+  - English: End every customer email with exactly:
     Please feel free to write to us for any further assistance.
-  * Arabic: End every customer email with exactly:
+  - Arabic: End every customer email with exactly:
     لا تترددوا بالتواصل معنا لأي مساعدة إضافية.
 - NO sign-off or signature: Never add "Best regards,", "Thanks,", or an agent name at the bottom (Groove appends the signature automatically).
 - For multi-part customer inquiries, use clean numbered points so each question is clearly answered.
@@ -106,7 +109,6 @@ def build_search_index():
             content = f.read()
 
         if is_ticket_file:
-            # Split by ticket header: ### Ticket #... or ##### Ticket #...
             parts = re.split(r"(?m)^#{3,5}\s+(Ticket\s+#\d+[^\n]*)", content)
             for i in range(1, len(parts), 2):
                 header = parts[i].strip()
@@ -115,7 +117,6 @@ def build_search_index():
                     continue
                 year_match = re.search(r"\((\d{4})-", header)
                 year = int(year_match.group(1)) if year_match else 2024
-                # Boost recent 2025-2026 tickets; slightly downweight older 2023-2024 tickets
                 weight = 1.20 if year >= 2025 else 0.85
                 docs.append({
                     "source": filename,
@@ -127,7 +128,6 @@ def build_search_index():
                 })
                 ticket_count += 1
         else:
-            # Split KB markdown files by article headings (#### or ###)
             parts = re.split(r"(?m)^#{3,4}\s+([^\n]+)", content)
             if len(parts) > 2:
                 for i in range(1, len(parts), 2):
@@ -140,7 +140,7 @@ def build_search_index():
                         "title": title,
                         "type": "KB",
                         "year": 2026,
-                        "weight": 1.40,  # Official KB always gets priority boost
+                        "weight": 1.40,
                         "text": f"KB Article: {title}\n{body[:2500]}",
                     })
                     kb_count += 1
@@ -193,7 +193,6 @@ def retrieve_context(bm25, docs, query: str, top_k: int = 6):
         return []
 
     subqueries = extract_english_subqueries(query)
-    # Also include the raw query in case there are exact Arabic ticket matches
     all_queries = subqueries + [query]
 
     best_per_doc = {}
@@ -214,44 +213,22 @@ def retrieve_context(bm25, docs, query: str, top_k: int = 6):
             if idx not in best_per_doc or weighted_score > best_per_doc[idx]:
                 best_per_doc[idx] = weighted_score
 
-    # Sort all unique matched docs by best score; allow more slots for multi-point emails
     max_docs = max(top_k, min(12, len(subqueries) * 2))
     ranked = sorted(best_per_doc.items(), key=lambda x: x[1], reverse=True)
     return [docs[idx] for idx, _ in ranked[:max_docs]]
-
-    raw_scores = bm25.get_scores(tokens)
-    scored = []
-    for idx, score in enumerate(raw_scores):
-        if score > 0:
-            weighted = score * docs[idx]["weight"]
-            scored.append((weighted, idx))
-
-    scored.sort(reverse=True)
-    # Keep a balanced mix: up to 3 KB articles + top Tickets
-    selected = []
-    kb_added = 0
-    for _, idx in scored[:25]:
-        d = docs[idx]
-        if d["type"] == "KB" and kb_added < 3:
-            selected.append(d)
-            kb_added += 1
-        elif d["type"] == "Ticket" and len(selected) < top_k:
-            selected.append(d)
-        if len(selected) >= top_k:
-            break
-    return selected
 
 
 # ================= GROQ LLM CALL =================
 def clean_for_groove(text: str) -> str:
     """Strip any stray Markdown symbols so the draft is 100% plain-text ready for Groove."""
-    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)      # Remove **bold**
-    text = re.sub(r"__(.*?)__", r"\1", text)          # Remove __bold__
-    text = re.sub(r"(?m)^#{1,6}\s+", "", text)        # Remove ### headers
-    text = re.sub(r"`([^`]+)`", r"\1", text)          # Remove `code` backticks
-    text = re.sub(r"[ \t]+\n", "\n", text)            # Clean trailing spaces
+    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
+    text = re.sub(r"__(.*?)__", r"\1", text)
+    text = re.sub(r"(?m)^#{1,6}\s+", "", text)
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    text = re.sub(r"[ \t]+\n", "\n", text)
     return text.strip()
-    
+
+
 def call_groq(model_id: str, user_prompt: str, temperature: float = 0.25) -> tuple[str, str]:
     client = Groq(api_key=GROQ_API_KEY)
     try:
@@ -300,7 +277,7 @@ if TEAM_PASSWORD:
 
 # ================= MAIN UI =================
 if not GROQ_API_KEY:
-    st.error("Missing `GROQ_API_KEY` secret. Add it in Hugging Face Space Settings → Variables and secrets.")
+    st.error("Missing `GROQ_API_KEY` secret. Add it in Streamlit Cloud Settings → Secrets.")
     st.stop()
 
 bm25, docs, kb_count, ticket_count = build_search_index()
