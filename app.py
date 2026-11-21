@@ -35,7 +35,6 @@ MODELS = {
     "GPT-OSS 20B (Ultra-Fast)": "openai/gpt-oss-20b",
 }
 FALLBACK_MODEL = "openai/gpt-oss-20b"
-QUERY_EXTRACTOR_MODEL = "llama-3.1-8b-instant"
 
 SYSTEM_PROMPT = """You are a Sapaad Customer Support email assistant. Your job is to draft customer replies, refine rough drafts, and write internal Groove ticket notes using the provided Sapaad Knowledge Base (KB) and historical Groove Support Tickets as your primary references.
 
@@ -164,44 +163,52 @@ def build_search_index():
     return bm25, docs, kb_count, ticket_count
 
 
-def extract_english_subqueries(text: str) -> list[str]:
+def extract_english_subqueries(text: str, model_id: str) -> list[str]:
     """Translate and split any Arabic or English email into clean English Sapaad search queries."""
-    try:
-        client = Groq(api_key=GROQ_API_KEY)
-        resp = client.chat.completions.create(
-            model=QUERY_EXTRACTOR_MODEL,
-            messages=[{
-                "role": "user",
-                "content": (
-                    "You are a search query translator for Sapaad POS support documentation.\n"
-                    "Read the customer email below (which may be in Arabic or English) and extract each distinct "
-                    "support topic as a short ENGLISH search query (3 to 6 English keywords per line).\n"
-                    "Use standard Sapaad terms where relevant (e.g., Sapaad Direct, Sapaad.Online, QR code, "
-                    "waiter hailing, delivery zones, OTP, Email OTP, SMS, scheduled orders, cash on delivery, API).\n"
-                    "Output ONLY the English lines—no Arabic, no numbering, no bullets, no intro text. Max 8 lines.\n\n"
-                    f"{text[:2500]}"
-                ),
-            }],
-            temperature=0.0,
-            max_tokens=200,
-        )
-        raw = (resp.choices[0].message.content or "").strip()
-        lines = []
-        for ln in raw.splitlines():
-            cleaned = re.sub(r"^[\d\.\-\•\*\s]+", "", ln).strip()
-            if cleaned and re.search(r"[a-zA-Z]{2,}", cleaned):
-                lines.append(cleaned)
-        return lines[:8] if lines else [text]
-    except Exception:
-        return [text]
+    client = Groq(api_key=GROQ_API_KEY)
+    models_to_try = [model_id] if model_id == FALLBACK_MODEL else [model_id, FALLBACK_MODEL]
+    last_error = None
+
+    for m in models_to_try:
+        try:
+            resp = client.chat.completions.create(
+                model=m,
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        "Extract each distinct Sapaad POS / Sapaad.Online / Sapaad Direct support topic "
+                        "from the customer email below as a short ENGLISH search query (3 to 6 English keywords per line).\n"
+                        "Use standard Sapaad terms where relevant (e.g., Sapaad Direct, Sapaad.Online, QR code, "
+                        "waiter hailing, delivery areas, delivery fee, OTP, Email OTP, SMS, scheduled orders, cash on delivery, API).\n"
+                        "Output ONLY the English lines—no Arabic, no numbering, no bullets, no intro text. Max 8 lines.\n\n"
+                        f"{text[:2500]}"
+                    ),
+                }],
+                temperature=0.0,
+                max_tokens=1000,
+            )
+            raw = (resp.choices[0].message.content or "").strip()
+            lines = []
+            for ln in raw.splitlines():
+                cleaned = re.sub(r"^[\d\.\-\•\*\s]+", "", ln).strip()
+                if cleaned and re.search(r"[a-zA-Z]{2,}", cleaned):
+                    lines.append(cleaned)
+            if lines:
+                return lines[:8]
+        except Exception as e:
+            last_error = e
+
+    if last_error:
+        st.warning(f"English query translation failed ({last_error}); falling back to original text.")
+    return [text]
 
 
-def retrieve_context(bm25, docs, query: str, top_k: int = 6):
+def retrieve_context(bm25, docs, query: str, model_id: str, top_k: int = 6):
     """Search English KB & Tickets per topic using round-robin so every point gets English matches."""
     if not bm25 or not query.strip():
         return [], []
 
-    subqueries = extract_english_subqueries(query)
+    subqueries = extract_english_subqueries(query, model_id)
 
     selected = []
     seen_ids = set()
@@ -390,8 +397,11 @@ with col2:
             st.warning("Please enter an email or draft first.")
         else:
             with st.spinner("Searching Sapaad KB & Tickets and generating..."):
+                search_source = customer_email.strip() or agent_notes.strip()
                 if mode != "Internal Note / Summary":
-                    matches, used_queries = retrieve_context(bm25, docs, search_query, top_k=top_k)
+                    matches, used_queries = retrieve_context(
+                        bm25, docs, search_source, MODELS[model_label], top_k=top_k
+                    )
                 else:
                     matches, used_queries = [], []
 
