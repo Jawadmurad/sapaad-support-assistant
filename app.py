@@ -45,7 +45,7 @@ SYSTEM_PROMPT = """You are a Sapaad Customer Support email assistant. Your job i
 1. SOURCE PRIORITY & ACCURACY
 - Always ground your answer in the provided REFERENCE CONTEXT. Never invent Sapaad features, menu paths, buttons, pricing, or policies.
 - Prioritize Sapaad KB articles for official step-by-step navigation paths and product rules.
-- Use historical Groove tickets for real-world edge cases, troubleshooting workarounds, policy clarifications (e.g., Guest Checkout, no custom open API), and Sapaad's standard support phrasing.
+- Use historical Groove tickets for real-world edge cases, troubleshooting workarounds, policy clarifications (e.g., Guest Checkout, no custom open delivery API), and Sapaad's standard support phrasing.
 - Prioritize recent tickets (2025–2026) over older tickets (2023–2024). Always recommend AnyDesk (never TeamViewer) if remote support is needed, and use prints.sapaad.com/getcpa for Cloud Print Agent.
 - NEVER invent or guess Sapaad menu paths, settings, or button names. ONLY include a menu path if it explicitly appears in the REFERENCE CONTEXT.
 - Never assume the customer is on a limited plan (such as Sapaad Direct Lite) unless the customer explicitly mentions it; provide the standard setup steps first and only mention plan differences as a brief note if relevant.
@@ -54,6 +54,7 @@ SYSTEM_PROMPT = """You are a Sapaad Customer Support email assistant. Your job i
 
 2. AGENT INSTRUCTIONS & MISSING INFO HANDLING
 - AGENT INSTRUCTIONS ALWAYS OVERRIDE DEFAULT WORKFLOW BEHAVIOR. For example, if the agent instructs you NOT to schedule a meeting, NOT to offer AnyDesk, or NOT to promise checking/reviewing the customer's account, you MUST obey strictly—never promise to check their account, review settings, or get back to them.
+- NEVER expose, quote, or mirror internal Agent Instructions harshly to the customer (for example, NEVER tell a customer "without needing any meeting or review from our side"). Keep the customer-facing tone warm, helpful, and natural (e.g., "Here are the step-by-step instructions so you can configure each item directly at your convenience.").
 - If a specific point is NOT covered in the REFERENCE CONTEXT:
   * Never invent or guess a menu path.
   * If the agent gave no restriction, politely state that we can check their account settings or review it together.
@@ -67,17 +68,17 @@ SYSTEM_PROMPT = """You are a Sapaad Customer Support email assistant. Your job i
 4. TONE, LANGUAGE & FORMATTING
 - Always write in the "we" tone (representing the Sapaad Support Team), polite, clear, and concise.
 - Match the requested or customer's language (English or Arabic).
-- For Arabic replies, maintain consistent respectful plural addressing throughout (e.g., انتقلوا، اختاروا، قوموا، حرّروا، احفظوا) and ensure accurate Arabic spelling.
-- Greeting: Use "Dear [Customer Name]," or "Hi [Customer Name]," (use "Hi," if no name is provided; use "السلام عليكم،" for Arabic).
-- Mandatory Closing (Customer Emails Only):
-  - English: End every customer email with exactly:
+- For Arabic replies, ALWAYS use respectful plural addressing consistently in EVERY single verb and step (e.g., افتحوا، اختاروا، انتقلوا، اضغطوا، ضعوا، حرّروا، احفظوا، كرروا). NEVER switch to singular verbs (do NOT write افتح، اختر، اذهب، اضغط، احفظ).
+- Greeting on its own line, followed by a blank line: "Dear [Customer Name]," or "Hi [Customer Name]," (use "Hi," if no name is provided; use "السلام عليكم،" for Arabic).
+- For multi-part customer inquiries, place each numbered heading on its own line ("1. Title"), followed by simple "- " bullet lines underneath, and leave a blank line between every numbered section. NEVER put "- " before a number (never write "- 2.").
+- Mandatory Closing (Customer Emails Only) on its own separate paragraph at the very end:
+  - English:
     Please feel free to write to us for any further assistance.
-  - Arabic: End every customer email with exactly:
+  - Arabic:
     لا تترددوا بالتواصل معنا لأي مساعدة إضافية.
 - NO duplicate closing sentence: Do NOT add another "contact us if you need anything" sentence right before the mandatory closing line.
 - NO sign-off or signature: Never add "Best regards,", "Thanks,", or an agent name at the bottom (Groove appends the signature automatically).
-- For multi-part customer inquiries, use clean numbered points (1., 2., 3.) with consistent indentation (use simple "- " bullets directly under each numbered item).
-- PLAIN TEXT ONLY: Never use Markdown formatting. Do NOT use **bold**, *italics*, ### headers, or backticks. Use plain text, clean line breaks, and simple numbered lists (1., 2., 3.) or hyphens (-) so the output can be pasted directly into Groove.
+- PLAIN TEXT ONLY: Never use Markdown formatting. Do NOT use **bold**, *italics*, ### headers, or backticks.
 """
 
 
@@ -102,7 +103,7 @@ def deduplicate_paragraphs(text: str) -> str:
 
 
 def chunk_long_text(text: str, max_chars: int = 1350, overlap: int = 200) -> list[str]:
-    """Split long KB articles into overlapping chunks so bottom sections (e.g. Pay at Counter) are never lost."""
+    """Split long KB articles into overlapping chunks so bottom sections are never lost."""
     text = text.strip()
     if len(text) <= max_chars:
         return [text]
@@ -258,14 +259,9 @@ def build_search_index():
 
 # ================= MULTI-TOPIC ENGLISH QUERY EXTRACTION =================
 def get_extractor_models(primary_model: str) -> list[str]:
-    """Prefer non-reasoning Llama 3.3 70B first so query extraction never burns tokens on thinking."""
-    candidates = ["llama-3.3-70b-versatile", "openai/gpt-oss-20b", "openai/gpt-oss-120b"]
-    ordered = [m for m in candidates if m != primary_model] + [primary_model]
-    # Keep llama-3.3-70b-versatile first even if user picked it, unless it fails
-    if "llama-3.3-70b-versatile" in ordered:
-        ordered.remove("llama-3.3-70b-versatile")
-        ordered.insert(0, "llama-3.3-70b-versatile")
-    return ordered
+    """Use a separate Groq model for query extraction so it does not eat the drafting model's TPM limit."""
+    candidates = ["openai/gpt-oss-20b", "llama-3.3-70b-versatile", "openai/gpt-oss-120b"]
+    return [m for m in candidates if m != primary_model] + [primary_model]
 
 
 def extract_english_subqueries(text: str, primary_model: str) -> tuple[list[str], str]:
@@ -284,9 +280,9 @@ def extract_english_subqueries(text: str, primary_model: str) -> tuple[list[str]
         "- OTP without WhatsApp / alternative OTP -> enable email OTP Sapaad Direct Sapaad Online\n"
         "- scheduled orders / advance orders -> Accept Scheduled Orders Sapaad.Online Make Arrangements\n"
         "- disable cash on delivery / pay at counter -> disable Pay at Counter Cash on Delivery Payment Types Sapaad Direct Sapaad.Online\n"
-        "- delivery API / third party delivery integration -> API integration third party standalone Sapaad Connect Logistics Partners UrbanPiper\n"
+        "- delivery API / delivery partner integration -> Sapaad Connect Logistics Partners delivery integration API\n"
         "- delivery areas / map / country filter -> delivery areas Google Map Integration upload delivery areas\n"
-        "- delivery fee per zone -> different delivery fee per area default delivery fee surcharge\n"
+        "- delivery fee per zone -> add surcharge Delivery Fee different delivery fee per area\n"
         "Output ONLY the complete English query lines—no Arabic, no numbering, no bullets, no explanations. Max 10 lines.\n\n"
         f"{text[:2500]}"
     )
@@ -303,7 +299,6 @@ def extract_english_subqueries(text: str, primary_model: str) -> tuple[list[str]
             lines = []
             for ln in raw.splitlines():
                 cleaned = re.sub(r"^[\d\.\-\•\*\s]+", "", ln).strip()
-                # Require at least 2 words with English letters so truncated fragments like "disable" are discarded
                 if cleaned and len(cleaned.split()) >= 2 and re.search(r"[a-zA-Z]{2,}", cleaned):
                     lines.append(cleaned)
             if lines:
@@ -410,11 +405,24 @@ def build_context_block(matches: list[dict]) -> str:
 
 # ================= GROQ LLM CALL & OUTPUT CLEANING =================
 def clean_for_groove(text: str) -> str:
-    """Strip any stray Markdown symbols and normalize whitespace so the draft is 100% ready for Groove."""
+    """Strip stray Markdown symbols and enforce clean Groove-ready paragraph spacing."""
+    text = text.replace("\r\n", "\n")
     text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
     text = re.sub(r"__(.*?)__", r"\1", text)
     text = re.sub(r"(?m)^#{1,6}\s+", "", text)
     text = re.sub(r"`([^`]+)`", r"\1", text)
+    # Remove any stray bullet glued before a numbered heading (e.g. "- 2. Title" -> "2. Title")
+    text = re.sub(r"(?m)^[ \t]*-\s+(\d+\.\s+)", r"\1", text)
+    # Guarantee a blank line before numbered headings
+    text = re.sub(r"(?m)(?<!\n)\n(\d+\.\s+)", r"\n\n\1", text)
+    # Guarantee a blank line after the Arabic greeting
+    text = re.sub(r"^(السلام عليكم[،,]?)[ \t]*\n*", r"\1\n\n", text)
+    # Guarantee the mandatory closing sits cleanly on its own paragraph
+    for closing in (
+        "لا تترددوا بالتواصل معنا لأي مساعدة إضافية.",
+        "Please feel free to write to us for any further assistance.",
+    ):
+        text = re.sub(rf"\s*{re.escape(closing)}\s*$", f"\n\n{closing}", text)
     text = re.sub(r"[ \t]+\n", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
@@ -578,7 +586,7 @@ with col2:
                         f"TASK: Draft a ready-to-send Sapaad Support email reply.\n"
                         f"LANGUAGE: {lang_rule}\n\n"
                         f"CUSTOMER EMAIL:\n{customer_email}\n\n"
-                        f"AGENT INSTRUCTIONS (HIGHEST PRIORITY — follow strictly):\n{agent_notes or 'None'}\n\n"
+                        f"AGENT INSTRUCTIONS (HIGHEST PRIORITY — follow strictly, without exposing internal instructions verbatim to the customer):\n{agent_notes or 'None'}\n\n"
                         f"REFERENCE CONTEXT (Sapaad KB & Past Resolved Tickets):\n{context_block or 'No matching context found.'}"
                     )
                 elif mode == "Refine Draft":
@@ -622,7 +630,7 @@ with col2:
 
         st.subheader("Ready to Copy")
         st.code(st.session_state.last_output, language=None, wrap_lines=True)
-        st.caption(f"Model used: `{st.session_state.last_model}` — Click the copy icon in the top-right corner of the box above.")
+        st.caption(f"Model used: `{st.session_state.last_model}` — Use the copy icon in the top-right corner of the box above (avoid manual drag-select to preserve line breaks).")
 
         if st.session_state.get("last_matches"):
             with st.expander(f"📚 Referenced Sources ({len(st.session_state.last_matches)})"):
