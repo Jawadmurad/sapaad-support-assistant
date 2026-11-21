@@ -31,19 +31,19 @@ LOCAL_DATA_DIR = "data"
 
 MODELS = {
     "GPT-OSS 120B (Best Quality)": "openai/gpt-oss-120b",
-    "Llama 3.3 70B (High Limit / Fast)": "llama-3.3-70b-versatile",
+    "Qwen 3.8 27B (Strong Arabic/EN)": "qwen/qwen3.8-27b",
     "GPT-OSS 20B (Ultra-Fast)": "openai/gpt-oss-20b",
 }
-FALLBACK_MODEL = "llama-3.3-70b-versatile"
+FALLBACK_MODEL = "openai/gpt-oss-20b"
 
-# Token-safe limits for Groq Free Tier (8,000 TPM on GPT-OSS models)
+# Token-safe limits for Groq Free Tier (8,000 TPM on GPT-OSS / Qwen models)
 MAX_CONTEXT_CHARS = 10800
 MAX_DOC_CHARS = 1050
 
 SYSTEM_PROMPT = """You are a Sapaad Customer Support email assistant. Your job is to draft customer replies, refine rough drafts, and write internal Groove ticket notes using the provided Sapaad Knowledge Base (KB) and historical Groove Support Tickets as your primary references.
 
 1. SOURCE PRIORITY & ACCURACY (HIGHEST PRIORITY — NEVER COMPROMISE)
-- Always ground your answer in the provided REFERENCE CONTEXT. Never invent Sapaad features, menu paths, buttons, API-key workflows, third-party provider names, pricing, or policies.
+- Always ground factual Sapaad answers in the provided REFERENCE CONTEXT. Never invent Sapaad features, menu paths, buttons, API-key workflows, third-party provider names, pricing, or policies.
 - Factual accuracy ALWAYS overrides self-service preferences: even if the agent asks to let the customer configure everything alone, NEVER invent steps, API keys, or menu paths that do not exist in the REFERENCE CONTEXT. If a feature is an optional add-on, not self-service, or not supported via open API, state that clearly and honestly.
 - Prioritize Sapaad KB articles for official step-by-step navigation paths and product rules.
 - Use historical Groove tickets for real-world edge cases, troubleshooting workarounds, policy clarifications (e.g., Guest Checkout, no custom open delivery API), and Sapaad's standard support phrasing.
@@ -51,27 +51,33 @@ SYSTEM_PROMPT = """You are a Sapaad Customer Support email assistant. Your job i
 - NEVER invent or guess Sapaad menu paths, settings, or button names. ONLY write a ">" menu path if that exact path appears in the REFERENCE CONTEXT.
 - If a KB article mentions a prerequisite (such as "add a surcharge called Delivery Fee") without giving its menu path, state the prerequisite plainly WITHOUT adding any ">" menu path to it.
 - Never assume the customer is on a limited plan (such as Sapaad Direct Lite) unless the customer explicitly mentions it; provide the standard setup steps first and only mention plan differences as a brief note if relevant.
-- Always keep Sapaad UI menu paths and product names in clean, exact English (e.g., Setup > Sapaad Add-Ons > Sapaad Direct) even when replying in Arabic, and NEVER mix English and Arabic letters inside the same word.
+- Always keep Sapaad UI menu paths and product names in clean, exact English (e.g., Setup > Sapaad Add-Ons > Sapaad Direct, Zoom) even when replying in Arabic, and NEVER mix English and Arabic letters inside the same word.
 - Whenever providing Sapaad.Online configuration steps (delivery areas, delivery fees, scheduled orders, payment methods, timings, or menu changes), remind the customer to sync changes via: Setup > Sapaad Add-Ons > Sapaad.Online Settings > Synchronize > Save.
 
 2. AGENT INSTRUCTIONS & MISSING INFO HANDLING
 - Follow AGENT INSTRUCTIONS strictly for workflow decisions (e.g., do NOT schedule a meeting, do NOT offer AnyDesk, and do NOT promise checking/reviewing the customer's account if the agent instructs against it).
 - NEVER expose, quote, or mirror internal Agent Instructions harshly to the customer (never say "without needing any meeting or review from our side"). Keep the customer-facing tone warm, helpful, and natural.
-- If a specific point is NOT covered in the REFERENCE CONTEXT:
+- If a specific point is NOT covered in the REFERENCE CONTEXT (in Draft Reply mode):
   * Never invent or guess a menu path or technical workflow (such as API keys).
   * If the agent gave no restriction, politely state that we can check their account settings or review it together.
   * If the agent instructed you not to promise a review or meeting, state concisely what is supported or requires an add-on/partner integration without guessing fake steps, and flag the gap inside a short "[Agent Note: ...]" line at the very top of your output (the UI hides this automatically from the copyable email).
 - Write "[Agent Note: ...]" strictly as an internal note to the support agent (never address the customer inside it). Only include it if something genuinely needs the agent's attention.
 
-3. PRIVACY & PLACEHOLDER SAFETY
+3. REFINE DRAFT MODE RULES
+- When the task is REFINE DRAFT, your job is to noticeably elevate the agent's rough draft into polished, courteous, executive-grade Sapaad Support writing (in English or Arabic).
+- Fix all grammar, spelling, punctuation, and phrasing issues (e.g., in Arabic fix missing hamzas like الامارات -> الإمارات, refine phrasing like "جلسة زوم تدريبية" -> "جلسة تدريبية عبر Zoom", and improve sentence flow).
+- Preserve EVERY single piece of information, date, time, timezone, thank-you line, and request from the agent's draft—NEVER silently drop a sentence (such as "Thank you for reaching out" / "نشكركم على تواصلكم").
+- Do NOT add extra promises, unmentioned troubleshooting steps, or "[Agent Note]" blocks unless the draft contains a clear factual mistake against provided context.
+
+4. PRIVACY & PLACEHOLDER SAFETY
 - NEVER copy redacted placeholders ([PHONE_OR_ID], [EMAIL]), other customers' names, restaurant names, passwords, or expired Zoom/WeTransfer links from past tickets into a new draft.
 - Use clean bracketed placeholders like [Zoom Link] or [Date & Time] only if needed and not provided.
 
-4. TONE, LANGUAGE & FORMATTING
+5. TONE, LANGUAGE & FORMATTING
 - Always write in the "we" tone (representing the Sapaad Support Team), polite, clear, and concise.
-- Match the requested or customer's language (English or Arabic).
+- Match the requested or customer's/draft's language (English or Arabic).
 - For Arabic replies, ALWAYS use respectful plural addressing with accurate spelling in EVERY verb and step (e.g., افتحوا، اختاروا، انتقلوا، اضغطوا، ضعوا، حرّروا، احفظوا، كرروا). NEVER switch to singular verbs or misspell them (never write واختروا or اختر).
-- MANDATORY GREETING (Customer Emails Only): ALWAYS start line 1 with the greeting on its own line, followed by a blank line, THEN a brief 1-sentence polite opening line:
+- MANDATORY GREETING (Customer Emails Only): ALWAYS start line 1 with the greeting on its own line, followed by a blank line:
   - English: "Dear [Customer Name]," or "Hi [Customer Name]," (or "Hi," if no name is provided)
   - Arabic: "السلام عليكم،"
 - For multi-part customer inquiries, place each numbered heading on its own line ("1. Title"), followed by simple "- " bullet lines underneath, and leave a blank line between every numbered section. NEVER put "- " before a number.
@@ -163,7 +169,6 @@ def build_search_index():
     for filepath in sorted(glob.glob(os.path.join(data_dir, "*.md"))):
         filename = os.path.basename(filepath)
         is_ticket_file = filename.lower().startswith("tickets_")
-        # Give high-level subscription/overview blurbs a lower weight than step-by-step KB guides & 2025-2026 tickets
         kb_weight = 1.05 if filename.lower() in {"subscription.md", "pricing.md"} else 1.40
 
         with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
@@ -265,8 +270,8 @@ def build_search_index():
 
 # ================= MULTI-TOPIC ENGLISH QUERY EXTRACTION =================
 def get_extractor_models(primary_model: str) -> list[str]:
-    """Use a separate Groq model for query extraction so it does not eat the drafting model's TPM limit."""
-    candidates = ["openai/gpt-oss-20b", "llama-3.3-70b-versatile", "openai/gpt-oss-120b"]
+    """Use a separate active Groq free-tier model so query extraction does not collide with drafting TPM."""
+    candidates = ["openai/gpt-oss-20b", "qwen/qwen3.8-27b", "openai/gpt-oss-120b"]
     return [m for m in candidates if m != primary_model] + [primary_model]
 
 
@@ -417,25 +422,20 @@ def clean_for_groove(text: str, is_customer_email: bool = True) -> str:
     text = re.sub(r"__(.*?)__", r"\1", text)
     text = re.sub(r"(?m)^#{1,6}\s+", "", text)
     text = re.sub(r"`([^`]+)`", r"\1", text)
-    # Fix rare mixed-script brand typos & common Arabic verb typos
     text = re.sub(r"Sapa[\u0600-\u06FF]+", "Sapaad", text)
     text = re.sub(r"\bواختروا\b", "واختاروا", text)
     text = re.sub(r"\bاختروا\b", "اختاروا", text)
-    # Remove any stray bullet glued before a numbered heading (e.g. "- 2. Title" -> "2. Title")
     text = re.sub(r"(?m)^[ \t]*-\s+(\d+\.\s+)", r"\1", text)
-    # Guarantee a blank line before numbered headings
     text = re.sub(r"(?m)(?<!\n)\n(\d+\.\s+)", r"\n\n\1", text)
     text = text.strip()
 
     if is_customer_email:
-        # Ensure Arabic customer emails always begin with السلام عليكم،
         if re.search(r"[\u0600-\u06FF]", text):
             if not re.match(r"^(السلام عليكم|مرحب[ااً]|عزيزي|السادة)", text):
                 text = f"السلام عليكم،\n\n{text}"
             else:
                 text = re.sub(r"^(السلام عليكم[،,]?)[ \t]*\n*", r"\1\n\n", text)
 
-        # Guarantee the mandatory closing sits cleanly on its own paragraph
         for closing in (
             "لا تترددوا بالتواصل معنا لأي مساعدة إضافية.",
             "Please feel free to write to us for any further assistance.",
@@ -471,9 +471,11 @@ def call_groq(model_id: str, user_prompt: str, temperature: float = 0.2) -> tupl
         return (resp.choices[0].message.content or "").strip(), model_id
     except Exception as e:
         err_str = str(e).lower()
-        if "429" in err_str or "413" in err_str or "rate_limit" in err_str:
+        if "429" in err_str or "413" in err_str or "404" in err_str or "rate_limit" in err_str or "model_not_found" in err_str:
             trimmed_prompt = user_prompt[:11000]
-            retry_models = [m for m in [FALLBACK_MODEL, "openai/gpt-oss-20b"] if m != model_id] or [model_id]
+            retry_models = [
+                m for m in [FALLBACK_MODEL, "qwen/qwen3.8-27b", "openai/gpt-oss-120b"] if m != model_id
+            ] or [model_id]
             last_err = e
             for retry_model in retry_models:
                 try:
@@ -537,6 +539,7 @@ with st.sidebar:
 st.header(f"📩 {mode}")
 
 col1, col2 = st.columns([1, 1], gap="large")
+verify_kb = False
 
 with col1:
     if mode == "Draft Reply":
@@ -553,13 +556,18 @@ with col1:
     elif mode == "Refine Draft":
         agent_notes = st.text_area(
             "Your Rough Draft to Refine",
-            height=200,
+            height=220,
             placeholder="Paste your rough draft here...",
         )
         customer_email = st.text_area(
             "Customer Email (Optional context)",
-            height=140,
-            placeholder="Optional: paste the customer's email so the AI checks accuracy...",
+            height=120,
+            placeholder="Optional: paste the customer's email if you want extra context...",
+        )
+        verify_kb = st.checkbox(
+            "Verify technical steps against Sapaad KB & Tickets",
+            value=False,
+            help="Leave unchecked for fast, clean polishing of scheduling/general drafts.",
         )
     elif mode == "FAQ / Template":
         customer_email = st.text_area(
@@ -580,13 +588,21 @@ with col1:
 
 with col2:
     if generate_btn:
-        search_query = f"{customer_email}\n{agent_notes}".strip()
-        if not search_query:
-            st.warning("Please enter an email or draft first.")
+        if mode == "Refine Draft" and not agent_notes.strip():
+            st.warning("Please paste your rough draft to refine first.")
+        elif mode != "Refine Draft" and not f"{customer_email}\n{agent_notes}".strip():
+            st.warning("Please enter an email or topic first.")
         else:
-            with st.spinner("Searching Sapaad KB & Tickets and generating..."):
-                search_source = customer_email.strip() or agent_notes.strip()
-                if mode != "Internal Note / Summary":
+            should_retrieve = (mode in ("Draft Reply", "FAQ / Template")) or (mode == "Refine Draft" and verify_kb)
+            spinner_text = (
+                "Searching Sapaad KB & Tickets and generating..."
+                if should_retrieve
+                else "Polishing your draft..."
+            )
+
+            with st.spinner(spinner_text):
+                if should_retrieve:
+                    search_source = customer_email.strip() or agent_notes.strip()
                     matches, used_queries, extractor_used = retrieve_context(
                         bm25, docs, search_source, MODELS[model_label], top_k=top_k
                     )
@@ -596,7 +612,7 @@ with col2:
                 context_block = build_context_block(matches)
 
                 lang_rule = (
-                    "Match the customer's language (English or Arabic)."
+                    "Match the language of the input (English or Arabic)."
                     if language == "Auto (Match Customer)"
                     else f"Write the output in {language}."
                 )
@@ -609,14 +625,21 @@ with col2:
                         f"AGENT INSTRUCTIONS (follow strictly for workflow, without inventing paths/features or exposing internal instructions verbatim):\n{agent_notes or 'None'}\n\n"
                         f"REFERENCE CONTEXT (Sapaad KB & Past Resolved Tickets):\n{context_block or 'No matching context found.'}"
                     )
+                    temp = 0.2
                 elif mode == "Refine Draft":
                     prompt = (
-                        f"TASK: Refine the agent's rough draft. Polish grammar, clarity, structure, and Sapaad Support tone without changing the core meaning or adding extra promises. Apply greeting and mandatory closing rules.\n"
-                        f"LANGUAGE: {lang_rule}\n\n"
+                        f"TASK: REFINE DRAFT. Rewrite and polish the agent's rough draft into a clear, courteous, professional Sapaad Support email.\n"
+                        f"LANGUAGE: {lang_rule}\n"
+                        f"RULES:\n"
+                        f"- Fix all spelling, hamza/punctuation, and grammar mistakes.\n"
+                        f"- Noticeably improve phrasing and professional customer-support flow (do not just copy the draft word-for-word).\n"
+                        f"- Keep EVERY fact, date, time, timezone, thank-you sentence, and request from the rough draft—do NOT delete any sentence or add new promises.\n"
+                        f"- Apply Sapaad greeting and mandatory closing rules cleanly.\n\n"
                         f"AGENT ROUGH DRAFT:\n{agent_notes}\n\n"
-                        f"CUSTOMER EMAIL (if any):\n{customer_email or 'Not provided'}\n\n"
-                        f"REFERENCE CONTEXT (for verifying Sapaad terms/steps only):\n{context_block or 'None'}"
+                        f"CUSTOMER EMAIL (Optional context):\n{customer_email or 'Not provided'}\n\n"
+                        f"REFERENCE CONTEXT (Optional verification only):\n{context_block or 'Not requested'}"
                     )
+                    temp = 0.35
                 elif mode == "FAQ / Template":
                     prompt = (
                         f"TASK: Create a concise, reusable Sapaad Support email template with clean placeholders like [Customer Name].\n"
@@ -625,15 +648,17 @@ with col2:
                         f"EXTRA NOTES:\n{agent_notes or 'None'}\n\n"
                         f"REFERENCE CONTEXT:\n{context_block or 'None'}"
                     )
+                    temp = 0.2
                 else:
                     prompt = (
                         f"TASK: Write a concise English internal Groove note summarizing this ticket for teammates (translate if needed). Do NOT include a customer greeting or customer closing line.\n\n"
                         f"TICKET CONTENT:\n{customer_email}\n"
                         f"FOCUS:\n{agent_notes or 'Key issue, account details, and next action needed.'}"
                     )
+                    temp = 0.2
 
                 try:
-                    raw_output, used_model = call_groq(MODELS[model_label], prompt)
+                    raw_output, used_model = call_groq(MODELS[model_label], prompt, temperature=temp)
                     agent_note, body_text = split_agent_note(raw_output)
                     clean_email = clean_for_groove(
                         body_text, is_customer_email=(mode != "Internal Note / Summary")
