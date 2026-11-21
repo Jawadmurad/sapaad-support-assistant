@@ -57,6 +57,7 @@ SYSTEM_PROMPT = """You are a Sapaad Customer Support email assistant. Your job i
     لا تترددوا بالتواصل معنا لأي مساعدة إضافية.
 - NO sign-off or signature: Never add "Best regards,", "Thanks,", or an agent name at the bottom (Groove appends the signature automatically).
 - For multi-part customer inquiries, use clean numbered points so each question is clearly answered.
+- PLAIN TEXT ONLY: Never use Markdown formatting. Do NOT use **bold**, *italics*, ### headers, or backticks. Use plain text, clean line breaks, and simple numbered lists (1., 2., 3.) or hyphens (-) so the output can be pasted directly into Groove.
 """
 
 
@@ -190,6 +191,15 @@ def retrieve_context(bm25, docs, query: str, top_k: int = 6):
 
 
 # ================= GROQ LLM CALL =================
+def clean_for_groove(text: str) -> str:
+    """Strip any stray Markdown symbols so the draft is 100% plain-text ready for Groove."""
+    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)      # Remove **bold**
+    text = re.sub(r"__(.*?)__", r"\1", text)          # Remove __bold__
+    text = re.sub(r"(?m)^#{1,6}\s+", "", text)        # Remove ### headers
+    text = re.sub(r"`([^`]+)`", r"\1", text)          # Remove `code` backticks
+    text = re.sub(r"[ \t]+\n", "\n", text)            # Clean trailing spaces
+    return text.strip()
+    
 def call_groq(model_id: str, user_prompt: str, temperature: float = 0.25) -> tuple[str, str]:
     client = Groq(api_key=GROQ_API_KEY)
     try:
@@ -202,7 +212,7 @@ def call_groq(model_id: str, user_prompt: str, temperature: float = 0.25) -> tup
             temperature=temperature,
             max_tokens=1500,
         )
-        return resp.choices[0].message.content.strip(), model_id
+        return clean_for_groove(resp.choices[0].message.content), model_id
     except Exception as e:
         if "429" in str(e) or "rate_limit" in str(e).lower():
             if model_id != FALLBACK_MODEL:
@@ -215,7 +225,7 @@ def call_groq(model_id: str, user_prompt: str, temperature: float = 0.25) -> tup
                     temperature=temperature,
                     max_tokens=1500,
                 )
-                return resp.choices[0].message.content.strip(), f"{FALLBACK_MODEL} (fallback)"
+                return clean_for_groove(resp.choices[0].message.content), f"{FALLBACK_MODEL} (fallback)"
         raise
 
 
