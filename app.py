@@ -41,6 +41,9 @@ SYSTEM_PROMPT = """You are a Sapaad Customer Support email assistant. Your job i
 - Use historical Groove tickets for real-world edge cases, troubleshooting workarounds, and Sapaad's standard support phrasing.
 - Prioritize recent tickets (2025–2026) over older tickets (2023–2024). Always recommend AnyDesk (never TeamViewer) for remote support, and use the current Cloud Print Agent link (prints.sapaad.com/getcpa).
 - If the context does not clearly confirm an answer or requires account-level checking, add a short "[Agent Note: ...]" line at the very top before the email draft, and draft a polite clarification or AnyDesk request.
+- NEVER invent or guess Sapaad menu paths, settings, or button names. ONLY include a menu path if it appears in the REFERENCE CONTEXT below.
+- Always keep Sapaad UI menu paths in their original English (e.g., Setup > Location Setup > Self Ordering Systems > Sapaad Direct) even when replying in Arabic, because the Sapaad interface is in English.
+- If a specific point in a multi-part email is NOT covered in the REFERENCE CONTEXT, do NOT guess—state politely that we will review/confirm that item during the meeting or check their account settings.
 
 2. PRIVACY & PLACEHOLDER SAFETY
 - NEVER copy redacted placeholders ([PHONE_OR_ID], [EMAIL]), other customers' names, restaurant names, passwords, or expired Zoom/WeTransfer links from past tickets into a new draft.
@@ -160,12 +163,61 @@ def build_search_index():
     return bm25, docs, kb_count, ticket_count
 
 
+def extract_english_subqueries(text: str) -> list[str]:
+    """Break any Arabic or English email into focused English Sapaad search queries."""
+    try:
+        client = Groq(api_key=GROQ_API_KEY)
+        resp = client.chat.completions.create(
+            model=FALLBACK_MODEL,
+            messages=[{
+                "role": "user",
+                "content": (
+                    "Extract each distinct Sapaad POS / Sapaad.Online / Sapaad Direct support topic "
+                    "from the email below as a short English search query (3-6 keywords per line). "
+                    "Output ONLY the lines, maximum 8 lines, no numbering or explanations.\n\n"
+                    f"{text[:2000]}"
+                ),
+            }],
+            temperature=0.0,
+            max_tokens=180,
+        )
+        lines = [ln.strip("-•0123456789. ") for ln in resp.choices[0].message.content.splitlines() if ln.strip()]
+        return lines[:8] if lines else [text]
+    except Exception:
+        return [text]
+
+
 def retrieve_context(bm25, docs, query: str, top_k: int = 6):
+    """Run BM25 across English sub-queries + original query so Arabic emails match English KB & tickets."""
     if not bm25 or not query.strip():
         return []
-    tokens = tokenize(query)
-    if not tokens:
-        return []
+
+    subqueries = extract_english_subqueries(query)
+    # Also include the raw query in case there are exact Arabic ticket matches
+    all_queries = subqueries + [query]
+
+    best_per_doc = {}
+    per_query_limit = 2 if len(subqueries) > 1 else top_k
+
+    for q in all_queries:
+        tokens = tokenize(q)
+        if not tokens:
+            continue
+        raw_scores = bm25.get_scores(tokens)
+        scored = [
+            (score * docs[idx]["weight"], idx)
+            for idx, score in enumerate(raw_scores)
+            if score > 0
+        ]
+        scored.sort(reverse=True)
+        for weighted_score, idx in scored[:per_query_limit]:
+            if idx not in best_per_doc or weighted_score > best_per_doc[idx]:
+                best_per_doc[idx] = weighted_score
+
+    # Sort all unique matched docs by best score; allow more slots for multi-point emails
+    max_docs = max(top_k, min(12, len(subqueries) * 2))
+    ranked = sorted(best_per_doc.items(), key=lambda x: x[1], reverse=True)
+    return [docs[idx] for idx, _ in ranked[:max_docs]]
 
     raw_scores = bm25.get_scores(tokens)
     scored = []
