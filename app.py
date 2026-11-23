@@ -1,6 +1,9 @@
 import glob
+import json
 import os
 import re
+import urllib.error
+import urllib.request
 import streamlit as st
 from groq import Groq
 from huggingface_hub import snapshot_download
@@ -17,126 +20,228 @@ st.set_page_config(
 def get_secret(name: str, default: str = "") -> str:
     try:
         if name in st.secrets:
-            return str(st.secrets[name])
+            return str(st.secrets[name]).strip()
     except Exception:
         pass
-    return os.environ.get(name, default)
+    return os.environ.get(name, default).strip()
 
 
 GROQ_API_KEY = get_secret("GROQ_API_KEY")
+GEMINI_API_KEY = get_secret("GEMINI_API_KEY")
 HF_TOKEN = get_secret("HF_TOKEN")
 HF_DATASET_REPO = get_secret("HF_DATASET_REPO")
 TEAM_PASSWORD = get_secret("TEAM_PASSWORD")
 LOCAL_DATA_DIR = "data"
 
-MODELS = {
-    "GPT-OSS 120B (Best Quality)": "openai/gpt-oss-120b",
-    "Qwen 3.8 27B (Strong Arabic/EN)": "qwen/qwen3.8-27b",
-    "GPT-OSS 20B (Ultra-Fast)": "openai/gpt-oss-20b",
-}
-FALLBACK_MODEL = "openai/gpt-oss-20b"
-
-# Token-safe limits for Groq Free Tier (8,000 TPM on GPT-OSS / Qwen models)
 MAX_CONTEXT_CHARS = 10800
-MAX_DOC_CHARS = 1050
+
+# Model choices (provider, model_id)
+MODELS = {
+    "Groq: GPT-OSS 120B (Best Quality)": ("groq", "openai/gpt-oss-120b"),
+    "Groq: Qwen 3.8 27B (Strong Arabic/EN)": ("groq", "qwen/qwen3.8-27b"),
+    "Groq: GPT-OSS 20B (Ultra-Fast)": ("groq", "openai/gpt-oss-20b"),
+    "Gemini: 2.5 Flash (Strong Fallback / Arabic)": ("gemini", "gemini-2.5-flash"),
+    "Gemini: 2.5 Flash-Lite (Fast Fallback)": ("gemini", "gemini-2.5-flash-lite"),
+}
+
+# Automatic fallback order for main generation
+FALLBACK_CHAIN = [
+    ("groq", "openai/gpt-oss-120b"),
+    ("groq", "qwen/qwen3.8-27b"),
+    ("groq", "openai/gpt-oss-20b"),
+    ("gemini", "gemini-2.5-flash"),
+    ("gemini", "gemini-2.5-flash-lite"),
+]
+
+# Query extractor fallback order (uses fast/separate bucket first)
+EXTRACTOR_CHAIN = [
+    ("groq", "openai/gpt-oss-20b"),
+    ("groq", "qwen/qwen3.8-27b"),
+    ("gemini", "gemini-2.5-flash-lite"),
+    ("gemini", "gemini-2.5-flash"),
+]
+
+OVERVIEW_KB_FILES = {"subscription.md", "general.md", "about.md"}
 
 SYSTEM_PROMPT = """You are a Sapaad Customer Support email assistant. Your job is to draft customer replies, refine rough drafts, and write internal Groove ticket notes using the provided Sapaad Knowledge Base (KB) and historical Groove Support Tickets as your primary references.
 
-1. SOURCE PRIORITY & ACCURACY (HIGHEST PRIORITY — NEVER COMPROMISE)
-- Always ground factual Sapaad answers in the provided REFERENCE CONTEXT. Never invent Sapaad features, menu paths, buttons, API-key workflows, third-party provider names, pricing, or policies.
-- Factual accuracy ALWAYS overrides self-service preferences: even if the agent asks to let the customer configure everything alone, NEVER invent steps, API keys, or menu paths that do not exist in the REFERENCE CONTEXT. If a feature is an optional add-on, not self-service, or not supported via open API, state that clearly and honestly.
+1. SOURCE PRIORITY & ACCURACY
+- Always ground your answer in the provided REFERENCE CONTEXT. Never invent Sapaad features, menu paths, pricing, third-party provider names, API keys, or policies.
 - Prioritize Sapaad KB articles for official step-by-step navigation paths and product rules.
-- Use historical Groove tickets for real-world edge cases, troubleshooting workarounds, policy clarifications (e.g., Guest Checkout, no custom open delivery API), and Sapaad's standard support phrasing.
-- Prioritize recent tickets (2025–2026) over older tickets (2023–2024). Always recommend AnyDesk (never TeamViewer) if remote support is needed, and use prints.sapaad.com/getcpa for Cloud Print Agent.
-- NEVER invent or guess Sapaad menu paths, settings, or button names. ONLY write a ">" menu path if that exact path appears in the REFERENCE CONTEXT.
-- If a KB article mentions a prerequisite (such as "add a surcharge called Delivery Fee") without giving its menu path, state the prerequisite plainly WITHOUT adding any ">" menu path to it.
-- Never assume the customer is on a limited plan (such as Sapaad Direct Lite) unless the customer explicitly mentions it; provide the standard setup steps first and only mention plan differences as a brief note if relevant.
-- Always keep Sapaad UI menu paths and product names in clean, exact English (e.g., Setup > Sapaad Add-Ons > Sapaad Direct, Zoom) even when replying in Arabic, and NEVER mix English and Arabic letters inside the same word.
-- Whenever providing Sapaad.Online configuration steps (delivery areas, delivery fees, scheduled orders, payment methods, timings, or menu changes), remind the customer to sync changes via: Setup > Sapaad Add-Ons > Sapaad.Online Settings > Synchronize > Save.
+- Use historical Groove tickets for real-world edge cases, troubleshooting workarounds, and Sapaad's standard support phrasing.
+- Prioritize recent tickets (2025–2026) over older tickets (2023–2024). Always recommend AnyDesk (never TeamViewer) for remote support, and use the current Cloud Print Agent link (prints.sapaad.com/getcpa).
+- NEVER invent or guess Sapaad menu paths (`>`), settings, or button names—not even for prerequisite steps (e.g., if the context mentions creating a surcharge without giving its exact menu path, state the prerequisite clearly without inventing a `>` path). ONLY include a `>` menu path if it explicitly appears in the REFERENCE CONTEXT below.
+- Always keep Sapaad UI menu paths and product names in their exact original English (e.g., Setup > Location Setup > Self Ordering Systems > Sapaad Direct) even when replying in Arabic, with ZERO mixed-script typos.
+- Do NOT assume the customer is on a "Lite" plan unless they explicitly say so; provide the standard setup steps first and mention plan tiers only as a brief note if relevant.
+- Factual accuracy ALWAYS overrides "guide alone" instructions: if a feature is unsupported or requires Sapaad backend action (such as open APIs or backend integrations), state that limitation clearly instead of inventing self-serve steps.
+- If the context does not clearly confirm an answer or requires account-level checking, add a short "[Agent Note: ...]" line at the very top BEFORE the email greeting.
 
-2. AGENT INSTRUCTIONS & MISSING INFO HANDLING
-- Follow AGENT INSTRUCTIONS strictly for workflow decisions (e.g., do NOT schedule a meeting, do NOT offer AnyDesk, and do NOT promise checking/reviewing the customer's account if the agent instructs against it).
-- NEVER expose, quote, or mirror internal Agent Instructions harshly to the customer (never say "without needing any meeting or review from our side"). Keep the customer-facing tone warm, helpful, and natural.
-- If a specific point is NOT covered in the REFERENCE CONTEXT (in Draft Reply mode):
-  * Never invent or guess a menu path or technical workflow (such as API keys).
-  * If the agent gave no restriction, politely state that we can check their account settings or review it together.
-  * If the agent instructed you not to promise a review or meeting, state concisely what is supported or requires an add-on/partner integration without guessing fake steps, and flag the gap inside a short "[Agent Note: ...]" line at the very top of your output (the UI hides this automatically from the copyable email).
-- Write "[Agent Note: ...]" strictly as an internal note to the support agent (never address the customer inside it). Only include it if something genuinely needs the agent's attention.
+2. AGENT INSTRUCTIONS PRIORITY & TONE SAFETY
+- Strictly obey any AGENT INSTRUCTIONS provided by the support agent (e.g., do not offer a meeting, do not promise to check their account).
+- Follow agent instructions SILENTLY and NATURALLY—never leak abrupt internal instructions into the customer email (e.g., never tell the customer "without needing a meeting or review from our side"; instead say warmly "Below are the direct steps so you can configure each item easily").
 
-3. REFINE DRAFT MODE RULES
-- When the task is REFINE DRAFT, your job is to noticeably elevate the agent's rough draft into polished, courteous, executive-grade Sapaad Support writing (in English or Arabic).
-- Fix all grammar, spelling, punctuation, and phrasing issues (e.g., in Arabic fix missing hamzas like الامارات -> الإمارات, refine phrasing like "جلسة زوم تدريبية" -> "جلسة تدريبية عبر Zoom", and improve sentence flow).
-- Preserve EVERY single piece of information, date, time, timezone, thank-you line, and request from the agent's draft—NEVER silently drop a sentence (such as "Thank you for reaching out" / "نشكركم على تواصلكم").
-- Do NOT add extra promises, unmentioned troubleshooting steps, or "[Agent Note]" blocks unless the draft contains a clear factual mistake against provided context.
-
-4. PRIVACY & PLACEHOLDER SAFETY
+3. PRIVACY & PLACEHOLDER SAFETY
 - NEVER copy redacted placeholders ([PHONE_OR_ID], [EMAIL]), other customers' names, restaurant names, passwords, or expired Zoom/WeTransfer links from past tickets into a new draft.
-- Use clean bracketed placeholders like [Zoom Link] or [Date & Time] only if needed and not provided.
+- Use clean bracketed placeholders like [Zoom Link] or [Date & Time] only if the agent hasn't provided them.
 
-5. TONE, LANGUAGE & FORMATTING
+4. TONE, LANGUAGE & FORMATTING
 - Always write in the "we" tone (representing the Sapaad Support Team), polite, clear, and concise.
-- Match the requested or customer's/draft's language (English or Arabic).
-- For Arabic replies, ALWAYS use respectful plural addressing with accurate spelling in EVERY verb and step (e.g., افتحوا، اختاروا، انتقلوا، اضغطوا، ضعوا، حرّروا، احفظوا، كرروا). NEVER switch to singular verbs or misspell them (never write واختروا or اختر).
-- MANDATORY GREETING (Customer Emails Only): ALWAYS start line 1 with the greeting on its own line, followed by a blank line:
-  - English: "Dear [Customer Name]," or "Hi [Customer Name]," (or "Hi," if no name is provided)
-  - Arabic: "السلام عليكم،"
-- For multi-part customer inquiries, place each numbered heading on its own line ("1. Title"), followed by simple "- " bullet lines underneath, and leave a blank line between every numbered section. NEVER put "- " before a number.
-- Mandatory Closing (Customer Emails Only) on its own separate paragraph at the very end:
-  - English:
+- Match the requested or customer's language (English or Arabic).
+- In Arabic replies, use consistent respectful plural addressing throughout (e.g., افتحوا، اختاروا، انتقلوا، اضغطوا، حرّروا، احفظوا، قوموا — never mix singular and plural verbs, and spell واختاروا correctly).
+- Greeting:
+  - English: "Dear [Customer Name]," or "Hi [Customer Name]," (use "Hi," if no name is provided).
+  - Arabic: Always start with "السلام عليكم،" followed by a blank line and a brief 1-sentence warm opening before numbered points.
+- Mandatory Closing (Customer Emails Only — include ONCE, with NO duplicate closing sentence right above it):
+  - English: End every customer email with exactly:
     Please feel free to write to us for any further assistance.
-  - Arabic:
+  - Arabic: End every customer email with exactly:
     لا تترددوا بالتواصل معنا لأي مساعدة إضافية.
-- NO duplicate closing sentence right before the mandatory closing line.
 - NO sign-off or signature: Never add "Best regards,", "Thanks,", or an agent name at the bottom (Groove appends the signature automatically).
+- For multi-part customer inquiries, use clean numbered points (1., 2., 3.) with consistent spacing and blank lines between points.
 - PLAIN TEXT ONLY: Never use Markdown formatting. Do NOT use **bold**, *italics*, ### headers, or backticks.
 """
 
+REFINE_SYSTEM_PROMPT = """You are a senior Sapaad Customer Support editor. Your job is to polish and elevate an agent's rough draft into a clear, warm, professional Sapaad Support email ready to paste into Groove.
 
-# ================= TOKENIZATION & INDEXING =================
+RULES:
+- Preserve EVERY fact, date, time, link, thank-you sentence, and commitment from the agent's rough draft. Do NOT drop sentences or invent new promises.
+- Genuinely improve grammar, clarity, flow, and professional "we" tone (representing the Sapaad Support Team).
+- Keep Sapaad UI names and menu paths in English even when refining an Arabic email.
+- In Arabic, use consistent respectful plural addressing (e.g., تفضلوا، يرجى، يسعدنا، يمكنكم).
+- Apply proper greeting ("Hi [Name]," / "Dear [Name]," / "السلام عليكم،") and the exact mandatory closing line once at the end:
+  - English: Please feel free to write to us for any further assistance.
+  - Arabic: لا تترددوا بالتواصل معنا لأي مساعدة إضافية.
+- NO sign-off ("Best regards,", agent name) and NO Markdown formatting (**bold**, ###, backticks). Plain text only.
+"""
+
+
+# ================= SMART BM25+ CLEANING & SYNONYMS =================
+BOILERPLATE_PATTERNS = [
+    r"Did you know Sapaad is integrated with.*?(?=\n|$)",
+    r"Global Support Numbers:.*?(?=\n|$)",
+    r"NOTICE:\s*This electronic mail message.*$",
+    r"CONFIDENTIALITY CAUTION:.*$",
+    r"This email(?: and any attachments)? may contain confidential.*$",
+    r"قد تحتوي هذه الرسالة الإلكترونية على معلومات سرية.*$",
+    r"Sent from (?:my iPhone|my iPad|Outlook for \w+|Yahoo Mail|Mail for Windows|Samsung).*",
+    r"Get Outlook for (?:iOS|Android).*",
+    r"Please reconsider not printing out this email.*",
+    r"\[PHONE_OR_ID\]|\[EMAIL\]",
+]
+
+GENERIC_RESOLUTION_PATTERNS = [
+    r"could you please (?:further )?elaborate",
+    r"share the (?:name of your restaurant|registered email)",
+    r"forwarded your (?:details|request) to our sales team",
+    r"remotely connected to your (?:system|device) via anydesk and assisted",
+    r"contacted you and assisted you with your (?:query|requirement)",
+    r"tried (?:reaching|calling) you.*unable to get through",
+    r"kindly share your anydesk id",
+]
+
+# Static local Sapaad synonym dictionary (0 tokens, <1ms)
+SAPAAD_SYNONYMS = {
+    "receipt machine": "thermal printer cloud print agent",
+    "receipt printer": "thermal printer cloud print agent printing rules",
+    "bill printer": "thermal printer receipt print",
+    "kitchen printer": "kot kitchen slip printing rules cloud print agent",
+    "not printing": "cloud print agent cpa printing rules printer",
+    "kitchen screen": "kds kitchen display system",
+    "cancel item": "void item cancel order",
+    "delete item": "void remove menu item",
+    "delivery apps": "aggregators urbanpiper atlas sapaad connect",
+    "talabat": "urbanpiper atlas aggregator talabat",
+    "deliveroo": "urbanpiper atlas sapaad connect deliveroo",
+    "noon": "urbanpiper atlas noon food",
+    "careem": "urbanpiper atlas careem",
+    "online store": "sapaad.online online ordering",
+    "website ordering": "sapaad.online online ordering",
+    "qr menu": "sapaad direct qr code table qr",
+    "table ordering": "sapaad direct qr code dine in",
+    "waiter button": "waiter hailing sapaad direct",
+    "whatsapp otp": "email otp sms otp guest checkout",
+    "no otp": "guest checkout disable otp checkout mode",
+    "cash on delivery": "pay at counter cash on delivery payment types",
+    "cod": "pay at counter cash on delivery",
+    "zatca": "zatca phase 2 e-invoicing fatoora",
+    "fatoora": "zatca phase 2 e-invoicing",
+    "add branch": "add location subscription upgrade",
+    "new branch": "add location subscription upgrade",
+    "loyalty": "loyalty points rewards expiry",
+    "inventory": "inventory track stock ingredients recipes stock take",
+    "quickbooks": "quickbooks accounting sync integration",
+    "xero": "xero accounting sync integration",
+    "delivery fee": "delivery areas surcharge default delivery fee",
+    "scheduled order": "accept scheduled orders pre-order sapaad.online",
+    "api": "sapaad connect api integration logistics partners",
+}
+
+
+def clean_for_index(text: str) -> str:
+    """Remove noisy signatures, disclaimers, and normalize common Sapaad typos."""
+    cleaned = text
+    for pat in BOILERPLATE_PATTERNS:
+        cleaned = re.sub(pat, " ", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    cleaned = re.sub(r"\b(saapad|sappad|spaad|sapad)\b", "sapaad", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\bquickbook\b", "quickbooks", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\burban\s+piper\b", "urbanpiper", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\bany\s+desk\b", "anydesk", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned.strip()
+
+
+def expand_synonyms(query: str) -> str:
+    """Append Sapaad-native synonyms locally without using LLM tokens."""
+    q_lower = query.lower()
+    additions = []
+    for trigger, expansion in SAPAAD_SYNONYMS.items():
+        if trigger in q_lower:
+            additions.append(expansion)
+    if additions:
+        return f"{query} " + " ".join(additions)
+    return query
+
+
 def tokenize(text: str) -> list[str]:
     return re.findall(r"[\w\u0600-\u06FF]+", text.lower())
 
 
-def deduplicate_paragraphs(text: str) -> str:
-    """Remove identical repeated paragraphs often scraped in Groove ticket threads."""
-    seen = set()
-    cleaned = []
-    for para in re.split(r"\n+", text):
-        p = para.strip()
-        if not p:
-            continue
-        key = re.sub(r"\s+", " ", p.lower())
-        if key not in seen:
-            seen.add(key)
-            cleaned.append(p)
-    return "\n".join(cleaned)
+def split_ticket_parts(body: str) -> tuple[str, str]:
+    """Split a ticket body into (customer_part, resolution_part)."""
+    match = re.search(r"\*\*Support Resolution:\*\*|Support Resolution:", body, re.IGNORECASE)
+    if not match:
+        return body.strip(), ""
+    customer_part = body[:match.start()].strip()
+    resolution_part = body[match.end():].strip()
+    customer_part = re.sub(r"^\*\*Customer:\*\*\s*|Customer:\s*", "", customer_part, flags=re.IGNORECASE).strip()
+    return customer_part, resolution_part
 
 
-def chunk_long_text(text: str, max_chars: int = 1350, overlap: int = 200) -> list[str]:
-    """Split long KB articles into overlapping chunks so bottom sections are never lost."""
-    text = text.strip()
-    if len(text) <= max_chars:
-        return [text]
+def compute_ticket_weight(resolution_part: str, year: int) -> float:
+    """Score ticket reliability based on recency and resolution substance."""
+    if not resolution_part or len(resolution_part) < 35:
+        return 0.0  # Skip unresolved or empty-resolution tickets
 
-    chunks = []
-    start = 0
-    while start < len(text):
-        end = min(len(text), start + max_chars)
-        if end < len(text):
-            split_pos = text.rfind("\n", start + max_chars // 2, end)
-            if split_pos == -1:
-                split_pos = text.rfind(". ", start + max_chars // 2, end)
-            if split_pos != -1:
-                end = split_pos + 1
-        chunk = text[start:end].strip()
-        if len(chunk) >= 40:
-            chunks.append(chunk)
-        if end >= len(text):
-            break
-        start = max(end - overlap, start + 1)
-    return chunks
+    base = 1.25 if year >= 2025 else 0.85
+    if len(resolution_part) < 70:
+        return base * 0.40
+
+    if len(resolution_part) < 350:
+        for pat in GENERIC_RESOLUTION_PATTERNS:
+            if re.search(pat, resolution_part, re.IGNORECASE):
+                return base * 0.45
+
+    return base
 
 
+def format_ticket_for_context(header: str, customer_part: str, resolution_part: str) -> str:
+    """Context Diet: keep customer summary concise so the full resolution is never cut off."""
+    cust_short = clean_for_index(customer_part)[:420]
+    res_clean = resolution_part[:1600].strip()
+    return f"{header}\nCustomer Issue: {cust_short}\nSupport Resolution:\n{res_clean}"
+
+
+# ================= DATA LOADING & INDEXING =================
 def load_data_directory() -> str:
     """Use local ./data folder if present, otherwise download from Private HF Dataset."""
     if os.path.isdir(LOCAL_DATA_DIR) and glob.glob(os.path.join(LOCAL_DATA_DIR, "*.md")):
@@ -156,20 +261,37 @@ def load_data_directory() -> str:
     return ""
 
 
-@st.cache_resource(show_spinner="Indexing Sapaad KB & Support Tickets...")
+def chunk_kb_article(title: str, body: str, max_chunk: int = 1900, overlap: int = 250) -> list[str]:
+    """Split long KB articles into overlapping chunks so bottom sections aren't lost."""
+    body = body.strip()
+    if len(body) <= max_chunk:
+        return [body]
+    chunks = []
+    start = 0
+    while start < len(body):
+        end = start + max_chunk
+        chunks.append(body[start:end].strip())
+        if end >= len(body):
+            break
+        start = end - overlap
+    return chunks
+
+
+@st.cache_resource(show_spinner="Indexing Sapaad KB & Support Tickets (Smart BM25+)...")
 def build_search_index():
     data_dir = load_data_directory()
     if not data_dir:
-        return None, [], 0, 0
+        return None, [], 0, 0, 0
 
     docs = []
+    corpus = []
     kb_count = 0
     ticket_count = 0
+    skipped_tickets = 0
 
     for filepath in sorted(glob.glob(os.path.join(data_dir, "*.md"))):
         filename = os.path.basename(filepath)
         is_ticket_file = filename.lower().startswith("tickets_")
-        kb_weight = 1.05 if filename.lower() in {"subscription.md", "pricing.md"} else 1.40
 
         with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
             content = f.read()
@@ -180,28 +302,24 @@ def build_search_index():
                 header = parts[i].strip()
                 body = parts[i + 1].strip() if i + 1 < len(parts) else ""
                 if len(body) < 40:
+                    skipped_tickets += 1
                     continue
 
-                res_parts = re.split(r"\*{0,2}Support Resolution:\*{0,2}", body)
-                if len(res_parts) < 2:
-                    continue
-
-                cust_text = deduplicate_paragraphs(res_parts[0])
-                cust_text = re.sub(r"^\*{0,2}Customer:\*{0,2}\s*", "", cust_text).strip()
-                res_text = deduplicate_paragraphs("\n".join(res_parts[1:]))
-                if len(res_text) < 35:
-                    continue
-
+                customer_part, resolution_part = split_ticket_parts(body)
                 year_match = re.search(r"\((\d{4})-", header)
                 year = int(year_match.group(1)) if year_match else 2024
-                weight = 1.25 if year >= 2025 else 0.85
+                weight = compute_ticket_weight(resolution_part, year)
 
-                llm_text = (
-                    f"{header}\n"
-                    f"Customer Issue: {cust_text[:300]}\n"
-                    f"Support Resolution: {res_text[:1150]}"
-                )
-                search_text = f"{header} {header}\n{cust_text[:450]}\n{res_text[:1400]}"
+                if weight <= 0.0:
+                    skipped_tickets += 1
+                    continue
+
+                clean_title = clean_for_index(header)
+                clean_cust = clean_for_index(customer_part)[:600]
+                clean_res = clean_for_index(resolution_part)[:1600]
+
+                # BM25F-style field boosting: Title 3x, Customer Issue 2x, Resolution 1x
+                indexed_text = f"{clean_title} {clean_title} {clean_title} {clean_cust} {clean_cust} {clean_res}"
 
                 docs.append({
                     "source": filename,
@@ -209,11 +327,12 @@ def build_search_index():
                     "type": "Ticket",
                     "year": year,
                     "weight": weight,
-                    "text": llm_text,
-                    "search_text": search_text,
+                    "text": format_ticket_for_context(header, customer_part, resolution_part),
                 })
+                corpus.append(tokenize(indexed_text))
                 ticket_count += 1
         else:
+            kb_weight = 1.05 if filename.lower() in OVERVIEW_KB_FILES else 1.40
             parts = re.split(r"(?m)^#{2,4}\s+([^\n]+)", content)
             if len(parts) > 2:
                 for i in range(1, len(parts), 2):
@@ -221,11 +340,17 @@ def build_search_index():
                     body = parts[i + 1].strip() if i + 1 < len(parts) else ""
                     if len(body) < 35:
                         continue
-                    if "Consolidated Knowledge Base documentation" in body and "Total Articles:" in body:
+                    # Skip file-level table of contents / metadata blocks
+                    if "Total Articles:" in body[:250] or "Consolidated Knowledge Base" in body[:250]:
                         continue
 
-                    for idx_chunk, chunk in enumerate(chunk_long_text(body)):
-                        chunk_title = title if idx_chunk == 0 else f"{title} (Part {idx_chunk + 1})"
+                    for c_idx, chunk in enumerate(chunk_kb_article(title, body)):
+                        chunk_title = title if c_idx == 0 else f"{title} (Part {c_idx + 1})"
+                        clean_title = clean_for_index(title)
+                        clean_body = clean_for_index(chunk)
+                        # BM25F-style boost: KB Title 3x
+                        indexed_text = f"{clean_title} {clean_title} {clean_title} {clean_body}"
+
                         docs.append({
                             "source": filename,
                             "title": chunk_title,
@@ -233,266 +358,331 @@ def build_search_index():
                             "year": 2026,
                             "weight": kb_weight,
                             "text": f"KB Article: {chunk_title}\n{chunk}",
-                            "search_text": f"{title} {title}\n{chunk}",
                         })
+                        corpus.append(tokenize(indexed_text))
                         kb_count += 1
-            else:
-                chunks = re.split(r"(?m)^-{3,}\s*$", content)
-                for raw_chunk in chunks:
-                    raw_chunk = raw_chunk.strip()
-                    if len(raw_chunk) < 40:
-                        continue
-                    if "Consolidated Knowledge Base documentation" in raw_chunk and "Total Articles:" in raw_chunk:
-                        continue
-                    first_line = raw_chunk.splitlines()[0].strip("#* ")
-                    for idx_sub, sub in enumerate(chunk_long_text(raw_chunk)):
-                        chunk_title = first_line[:120] or filename
-                        if idx_sub > 0:
-                            chunk_title += f" (Part {idx_sub + 1})"
-                        docs.append({
-                            "source": filename,
-                            "title": chunk_title,
-                            "type": "KB",
-                            "year": 2026,
-                            "weight": kb_weight,
-                            "text": sub,
-                            "search_text": f"{chunk_title} {chunk_title}\n{sub}",
-                        })
-                        kb_count += 1
+            elif len(content.strip()) > 35:
+                clean_body = clean_for_index(content[:2500])
+                docs.append({
+                    "source": filename,
+                    "title": filename,
+                    "type": "KB",
+                    "year": 2026,
+                    "weight": kb_weight,
+                    "text": content[:2500],
+                })
+                corpus.append(tokenize(f"{filename} {filename} {clean_body}"))
+                kb_count += 1
 
     if not docs:
-        return None, [], 0, 0
+        return None, [], 0, 0, skipped_tickets
 
-    corpus = [tokenize(d["search_text"]) for d in docs]
     bm25 = BM25Okapi(corpus)
-    return bm25, docs, kb_count, ticket_count
+    return bm25, docs, kb_count, ticket_count, skipped_tickets
 
 
-# ================= MULTI-TOPIC ENGLISH QUERY EXTRACTION =================
-def get_extractor_models(primary_model: str) -> list[str]:
-    """Use a separate active Groq free-tier model so query extraction does not collide with drafting TPM."""
-    candidates = ["openai/gpt-oss-20b", "qwen/qwen3.8-27b", "openai/gpt-oss-120b"]
-    return [m for m in candidates if m != primary_model] + [primary_model]
-
-
-def extract_english_subqueries(text: str, primary_model: str) -> tuple[list[str], str]:
-    """Translate and split any Arabic or English email into Sapaad-native English search queries."""
+# ================= MULTI-PROVIDER LLM ENGINE (GROQ + GEMINI) =================
+def _call_groq_raw(model_id: str, system_prompt: str, user_prompt: str, temperature: float, max_tokens: int) -> str:
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY not configured")
     client = Groq(api_key=GROQ_API_KEY)
-    last_error = None
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": user_prompt})
 
-    extraction_prompt = (
-        "You are a search query translator for Sapaad POS Knowledge Base & Support Tickets.\n"
-        "Read the customer email below (Arabic or English) and extract EVERY distinct question or requirement "
-        "as its OWN separate line (NEVER merge two different points into one line).\n"
-        "Each line must be a short ENGLISH search query (3 to 7 keywords) mapped to exact Sapaad terminology:\n"
-        "- QR code setup / activation -> how to set up Sapaad Direct Generate QR Table QRs\n"
-        "- waiter button / call waiter -> Enable Waiter Hailing Sapaad Direct Pro Open Tab\n"
-        "- disable OTP / remove OTP / without OTP -> guest checkout Checkout Mode instead of OTP Sapaad Direct\n"
-        "- OTP without WhatsApp / alternative OTP -> enable email OTP Sapaad Direct Sapaad Online\n"
-        "- scheduled orders / advance orders -> Accept Scheduled Orders Sapaad.Online Make Arrangements\n"
-        "- disable cash on delivery / pay at counter -> disable Pay at Counter Cash on Delivery Payment Types Sapaad Direct Sapaad.Online\n"
-        "- delivery API / third party delivery integration -> open API third party delivery partner integration Sapaad Connect\n"
-        "- delivery areas / map / country filter -> delivery areas Google Map Integration upload delivery areas\n"
-        "- delivery fee per zone -> add surcharge Delivery Fee different delivery fee per area\n"
-        "Output ONLY the complete English query lines—no Arabic, no numbering, no bullets, no explanations. Max 10 lines.\n\n"
-        f"{text[:2500]}"
+    resp = client.chat.completions.create(
+        model=model_id,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    content = (resp.choices[0].message.content or "").strip()
+    if not content:
+        raise RuntimeError(f"Empty response from Groq model {model_id}")
+    return content
+
+
+def _call_gemini_raw(model_id: str, system_prompt: str, user_prompt: str, temperature: float, max_tokens: int) -> str:
+    """Zero-dependency Gemini REST API call using Python stdlib urllib."""
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY not configured")
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent"
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+        "generationConfig": {
+            "temperature": temperature,
+            "maxOutputTokens": max_tokens,
+        },
+    }
+    if system_prompt:
+        payload["system_instruction"] = {"parts": [{"text": system_prompt}]}
+
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "x-goog-api-key": GEMINI_API_KEY,
+        },
+        method="POST",
     )
 
-    for m in get_extractor_models(primary_model):
+    try:
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(f"Gemini HTTP {e.code}: {err_body[:300]}") from e
+
+    candidates = data.get("candidates") or []
+    if not candidates:
+        raise RuntimeError(f"Gemini returned no candidates: {str(data)[:200]}")
+    parts = (candidates[0].get("content") or {}).get("parts") or []
+    text = "".join(p.get("text", "") for p in parts).strip()
+    if not text:
+        raise RuntimeError(f"Empty text from Gemini model {model_id}")
+    return text
+
+
+def call_provider(provider: str, model_id: str, system_prompt: str, user_prompt: str, temperature: float, max_tokens: int) -> str:
+    if provider == "groq":
+        return _call_groq_raw(model_id, system_prompt, user_prompt, temperature, max_tokens)
+    if provider == "gemini":
+        return _call_gemini_raw(model_id, system_prompt, user_prompt, temperature, max_tokens)
+    raise ValueError(f"Unknown provider: {provider}")
+
+
+# ================= SMART BYPASS & QUERY EXTRACTION =================
+def should_bypass_llm_extraction(text: str) -> bool:
+    """Skip LLM query extraction for short, single-topic English emails (saves ~35% tokens)."""
+    stripped = text.strip()
+    if not stripped or len(stripped) > 350:
+        return False
+    # Never bypass if Arabic characters are present (needs cross-language translation)
+    if re.search(r"[\u0600-\u06FF]", stripped):
+        return False
+    # Never bypass multi-part numbered/bulleted emails or multiple questions
+    bullet_lines = re.findall(r"(?m)^\s*(?:\d+[\.\)]|[-•*])\s+", stripped)
+    if len(bullet_lines) >= 2 or stripped.count("?") >= 2:
+        return False
+    return True
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def extract_english_subqueries(text: str, draft_model_id: str) -> tuple[list[str], str]:
+    """Translate & split Arabic/multi-topic emails into Sapaad-native English queries with Groq->Gemini fallback."""
+    if should_bypass_llm_extraction(text):
+        cleaned = expand_synonyms(clean_for_index(text))
+        return [cleaned], "Smart Bypass (0 tokens)"
+
+    # Prefer a model different from the drafting model to avoid Groq TPM collisions
+    chain = [item for item in EXTRACTOR_CHAIN if item[1] != draft_model_id] + [
+        item for item in EXTRACTOR_CHAIN if item[1] == draft_model_id
+    ]
+
+    extractor_prompt = (
+        "You are a search query extractor for Sapaad POS support documentation.\n"
+        "Read the customer email below (Arabic or English) and extract EACH distinct support topic "
+        "as a separate short ENGLISH search query (3 to 7 English keywords per line). "
+        "Do NOT merge two different questions into one line.\n"
+        "Use exact Sapaad terminology where relevant:\n"
+        "- QR table ordering -> Sapaad Direct QR code setup\n"
+        "- Waiter call button -> waiter hailing Sapaad Direct\n"
+        "- Disable OTP / no OTP -> guest checkout Checkout Mode disable OTP\n"
+        "- WhatsApp OTP alternative -> enable Email OTP SMS\n"
+        "- Cash on delivery -> Pay at Counter Cash on Delivery payment types\n"
+        "- Scheduled / pre-orders -> Accept Scheduled Orders Sapaad.Online\n"
+        "- Delivery API / third-party courier -> Sapaad Connect logistics partners API integration\n"
+        "- Delivery fee per area -> Delivery Areas Delivery Fee surcharge\n"
+        "Output ONLY the English lines—no Arabic, no numbering, no bullets, no explanations. Max 10 lines.\n\n"
+        f"{text[:2600]}"
+    )
+
+    last_err = None
+    for provider, model_id in chain:
+        if provider == "groq" and not GROQ_API_KEY:
+            continue
+        if provider == "gemini" and not GEMINI_API_KEY:
+            continue
         try:
-            resp = client.chat.completions.create(
-                model=m,
-                messages=[{"role": "user", "content": extraction_prompt}],
-                temperature=0.0,
-                max_tokens=2000,
-            )
-            raw = (resp.choices[0].message.content or "").strip()
+            raw = call_provider(provider, model_id, "", extractor_prompt, temperature=0.0, max_tokens=1200)
             lines = []
             for ln in raw.splitlines():
                 cleaned = re.sub(r"^[\d\.\-\•\*\s]+", "", ln).strip()
+                # Filter out broken 1-word fragments and non-English lines
                 if cleaned and len(cleaned.split()) >= 2 and re.search(r"[a-zA-Z]{2,}", cleaned):
-                    lines.append(cleaned)
+                    lines.append(expand_synonyms(cleaned))
             if lines:
-                return lines[:10], m
+                return lines[:10], f"{provider}:{model_id}"
         except Exception as e:
-            last_error = e
+            last_err = e
+            continue
 
-    if last_error:
-        st.warning(f"English query translation failed ({last_error}); falling back to original text.")
-    return [text], "fallback-raw"
+    fallback_q = expand_synonyms(clean_for_index(text))
+    return [fallback_q], f"Fallback Raw ({str(last_err)[:60]})"
 
 
-def retrieve_context(bm25, docs, query: str, primary_model: str, top_k: int = 6):
-    """Balanced per-topic retrieval: guarantees EVERY customer point gets its best KB or Ticket match."""
+# ================= SMART BM25+ WITH RRF RETRIEVAL =================
+def retrieve_context(bm25, docs, query: str, draft_model_id: str, top_k: int = 6):
+    """Smart BM25+ with Per-Topic Guarantee + Reciprocal Rank Fusion (RRF) + Context Budget."""
     if not bm25 or not query.strip():
-        return [], [], ""
+        return [], [], "None"
 
-    subqueries, extractor_used = extract_english_subqueries(query, primary_model)
+    subqueries, extractor_used = extract_english_subqueries(query, draft_model_id)
+    is_multi_topic = len(subqueries) > 1
+    max_docs = max(top_k, min(11, len(subqueries) * 2)) if is_multi_topic else top_k
 
-    selected = []
-    seen_ids = set()
-    max_docs = max(top_k, min(12, len(subqueries) + 2))
+    rrf_scores = {}
+    k_rrf = 60
+    per_topic_priority = []
+    seen_priority = set()
 
-    per_query_ranked = []
     for q in subqueries:
         tokens = tokenize(q)
         if not tokens:
-            per_query_ranked.append((q, []))
             continue
         raw_scores = bm25.get_scores(tokens)
-        scored = sorted(
-            [(score * docs[idx]["weight"], idx) for idx, score in enumerate(raw_scores) if score > 0],
-            reverse=True,
-        )
-        per_query_ranked.append((q, scored[:20]))
+        scored = [
+            (score * docs[idx]["weight"], idx)
+            for idx, score in enumerate(raw_scores)
+            if score > 0 and docs[idx]["weight"] > 0
+        ]
+        scored.sort(reverse=True)
 
-    # Pass 1: Every single sub-query gets its #1 highest-scoring match (whether KB or Ticket)
-    first_pass_types = {}
-    for q, scored in per_query_ranked:
-        for weighted_score, idx in scored:
-            if idx not in seen_ids:
-                d = dict(docs[idx])
-                d["matched_query"] = q
-                selected.append(d)
-                seen_ids.add(idx)
-                first_pass_types[q] = d["type"]
-                break
+        # Accumulate RRF score across all subqueries
+        for rank, (_, idx) in enumerate(scored[:25], start=1):
+            rrf_scores[idx] = rrf_scores.get(idx, 0.0) + (1.0 / (k_rrf + rank))
+
+        # For multi-topic emails, guarantee the #1 match for EACH distinct topic
+        if is_multi_topic and scored:
+            for _, idx in scored[:5]:
+                if idx not in seen_priority:
+                    per_topic_priority.append(idx)
+                    seen_priority.add(idx)
+                    break
+
+    rrf_ranked = [idx for idx, _ in sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)]
+
+    # Assemble final list: per-topic top matches first, then RRF-ranked backfill with KB/Ticket balance
+    selected = []
+    seen = set()
+    total_chars = 0
+    kb_count = 0
+    ticket_count = 0
+    kb_cap = max(4, max_docs // 2 + 1)
+
+    def try_add(idx: int, enforce_kb_cap: bool = True) -> bool:
+        nonlocal total_chars, kb_count, ticket_count
+        if idx in seen:
+            return False
+        doc = docs[idx]
+        if enforce_kb_cap and doc["type"] == "KB" and kb_count >= kb_cap and ticket_count == 0:
+            return False
+        doc_len = len(doc["text"])
+        if total_chars + doc_len > MAX_CONTEXT_CHARS and len(selected) >= 3:
+            return False
+        selected.append(doc)
+        seen.add(idx)
+        total_chars += doc_len
+        if doc["type"] == "KB":
+            kb_count += 1
+        else:
+            ticket_count += 1
+        return True
+
+    # Pass 1: Guaranteed top match per topic (for multi-point emails)
+    for idx in per_topic_priority:
         if len(selected) >= max_docs:
             break
+        try_add(idx, enforce_kb_cap=False)
 
-    # Pass 2: Add complementary match (KB <-> Ticket) for remaining slots if relevant
-    if len(selected) < max_docs:
-        for q, scored in per_query_ranked:
-            wanted_type = "Ticket" if first_pass_types.get(q) == "KB" else "KB"
-            for weighted_score, idx in scored:
-                if weighted_score < 4.0:
-                    break
-                if idx not in seen_ids and docs[idx]["type"] == wanted_type:
-                    d = dict(docs[idx])
-                    d["matched_query"] = q
-                    selected.append(d)
-                    seen_ids.add(idx)
-                    break
-            if len(selected) >= max_docs:
-                break
+    # Pass 2: RRF ranked fill (balanced KB + Tickets)
+    for idx in rrf_ranked:
+        if len(selected) >= max_docs:
+            break
+        try_add(idx, enforce_kb_cap=True)
 
-    # Pass 3: Backfill up to top_k if it's a single-topic email
+    # Pass 3: Backfill without KB cap if still under top_k
     if len(selected) < top_k:
-        combined_tokens = tokenize(" ".join(subqueries))
-        raw_scores = bm25.get_scores(combined_tokens)
-        scored = sorted(
-            [(score * docs[idx]["weight"], idx) for idx, score in enumerate(raw_scores) if score > 0],
-            reverse=True,
-        )
-        for _, idx in scored:
-            if idx not in seen_ids:
-                d = dict(docs[idx])
-                d["matched_query"] = "combined"
-                selected.append(d)
-                seen_ids.add(idx)
+        for idx in rrf_ranked:
             if len(selected) >= top_k:
                 break
+            try_add(idx, enforce_kb_cap=False)
 
-    return selected[:max_docs], subqueries, extractor_used
-
-
-def build_context_block(matches: list[dict]) -> str:
-    """Build a token-safe reference context block that never exceeds MAX_CONTEXT_CHARS."""
-    if not matches:
-        return ""
-    per_doc_limit = min(MAX_DOC_CHARS, max(750, MAX_CONTEXT_CHARS // max(1, len(matches))))
-    parts = []
-    total_chars = 0
-    for m in matches:
-        snippet = m["text"][:per_doc_limit]
-        topic_tag = f" | Topic: {m.get('matched_query', '')}" if m.get("matched_query") else ""
-        block = f"[{m['type']} | {m['source']}{topic_tag}]\n{snippet}"
-        if total_chars + len(block) > MAX_CONTEXT_CHARS:
-            break
-        parts.append(block)
-        total_chars += len(block) + 7
-    return "\n\n---\n\n".join(parts)
+    # Clean display queries (hide appended synonym tails in UI)
+    display_queries = [q[:90] + ("..." if len(q) > 90 else "") for q in subqueries]
+    return selected, display_queries, extractor_used
 
 
-# ================= GROQ LLM CALL & OUTPUT CLEANING =================
-def clean_for_groove(text: str, is_customer_email: bool = True) -> str:
-    """Strip Markdown symbols, fix minor typos, and enforce Groove-ready greeting & spacing."""
-    text = text.replace("\r\n", "\n")
+# ================= OUTPUT CLEANING & AGENT NOTE SEPARATION =================
+def extract_agent_note(text: str) -> tuple[str, str]:
+    """Separate any [Agent Note: ...] lines so Ready to Copy is 100% customer-safe."""
+    notes = re.findall(r"(?i)\[Agent Note:\s*([^\]]+)\]", text)
+    cleaned = re.sub(r"(?i)^\s*\[Agent Note:[^\]]+\]\s*\n*", "", text, flags=re.MULTILINE)
+    cleaned = re.sub(r"(?i)\[Agent Note:[^\]]+\]", "", cleaned)
+    return "\n".join(n.strip() for n in notes), cleaned.strip()
+
+
+def clean_for_groove(text: str, mode: str) -> str:
+    """Strip Markdown, fix mixed-script/Arabic slips, and guarantee clean Groove spacing."""
     text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
     text = re.sub(r"__(.*?)__", r"\1", text)
     text = re.sub(r"(?m)^#{1,6}\s+", "", text)
     text = re.sub(r"`([^`]+)`", r"\1", text)
-    text = re.sub(r"Sapa[\u0600-\u06FF]+", "Sapaad", text)
-    text = re.sub(r"\bواختروا\b", "واختاروا", text)
-    text = re.sub(r"\bاختروا\b", "اختاروا", text)
-    text = re.sub(r"(?m)^[ \t]*-\s+(\d+\.\s+)", r"\1", text)
-    text = re.sub(r"(?m)(?<!\n)\n(\d+\.\s+)", r"\n\n\1", text)
-    text = text.strip()
 
-    if is_customer_email:
-        if re.search(r"[\u0600-\u06FF]", text):
-            if not re.match(r"^(السلام عليكم|مرحب[ااً]|عزيزي|السادة)", text):
-                text = f"السلام عليكم،\n\n{text}"
-            else:
-                text = re.sub(r"^(السلام عليكم[،,]?)[ \t]*\n*", r"\1\n\n", text)
+    # Fix common mixed-script and Arabic spelling slips
+    text = re.sub(r"Sapa[\u0600-\u06FF]+", "Sapaad", text, flags=re.IGNORECASE)
+    text = text.replace("واختروا", "واختاروا")
+    text = text.replace("حرّرو ", "حرّروا ").replace("قموا ", "قوموا ")
 
-        for closing in (
-            "لا تترددوا بالتواصل معنا لأي مساعدة إضافية.",
-            "Please feel free to write to us for any further assistance.",
-        ):
-            text = re.sub(rf"\s*{re.escape(closing)}\s*$", f"\n\n{closing}", text)
-
+    # Normalize spacing
     text = re.sub(r"[ \t]+\n", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
+    text = text.strip()
+
+    # Ensure Arabic customer replies start with السلام عليكم،
+    if mode in ("Draft Reply", "Refine Draft") and re.search(r"[\u0600-\u06FF]", text):
+        first_line = text.splitlines()[0].strip() if text else ""
+        if "السلام عليكم" not in first_line and "مرحباً" not in first_line and "مرحبا" not in first_line:
+            text = f"السلام عليكم،\n\n{text}"
+
+    return text
 
 
-def split_agent_note(text: str) -> tuple[str, str]:
-    """Extract optional leading [Agent Note: ...] so it displays separately from the copyable email."""
-    match = re.match(r"^\s*\[Agent Note:\s*(.*?)\]\s*\n+", text, flags=re.IGNORECASE | re.DOTALL)
-    if match:
-        note = re.sub(r"\*\*(.*?)\*\*", r"\1", match.group(1)).strip()
-        return note, text[match.end():].strip()
-    return "", text.strip()
+def generate_with_fallback(
+    preferred_provider: str,
+    preferred_model: str,
+    system_prompt: str,
+    user_prompt: str,
+    mode: str,
+    temperature: float = 0.25,
+    max_tokens: int = 2800,
+) -> tuple[str, str, str]:
+    """Try preferred model first, then automatically cascade through Groq -> Gemini fallback chain."""
+    chain = [(preferred_provider, preferred_model)]
+    for item in FALLBACK_CHAIN:
+        if item not in chain:
+            chain.append(item)
 
+    errors = []
+    for idx, (provider, model_id) in enumerate(chain):
+        if provider == "groq" and not GROQ_API_KEY:
+            continue
+        if provider == "gemini" and not GEMINI_API_KEY:
+            continue
+        try:
+            raw_output = call_provider(provider, model_id, system_prompt, user_prompt, temperature, max_tokens)
+            agent_note, body = extract_agent_note(raw_output)
+            clean_body = clean_for_groove(body, mode)
+            label = f"{provider}:{model_id}" if idx == 0 else f"{provider}:{model_id} (auto-fallback)"
+            return clean_body, agent_note, label
+        except Exception as e:
+            errors.append(f"{provider}:{model_id} -> {str(e)[:120]}")
+            continue
 
-def call_groq(model_id: str, user_prompt: str, temperature: float = 0.2) -> tuple[str, str]:
-    client = Groq(api_key=GROQ_API_KEY)
-    try:
-        resp = client.chat.completions.create(
-            model=model_id,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=temperature,
-            max_tokens=2800,
-        )
-        return (resp.choices[0].message.content or "").strip(), model_id
-    except Exception as e:
-        err_str = str(e).lower()
-        if "429" in err_str or "413" in err_str or "404" in err_str or "rate_limit" in err_str or "model_not_found" in err_str:
-            trimmed_prompt = user_prompt[:11000]
-            retry_models = [
-                m for m in [FALLBACK_MODEL, "qwen/qwen3.8-27b", "openai/gpt-oss-120b"] if m != model_id
-            ] or [model_id]
-            last_err = e
-            for retry_model in retry_models:
-                try:
-                    resp = client.chat.completions.create(
-                        model=retry_model,
-                        messages=[
-                            {"role": "system", "content": SYSTEM_PROMPT},
-                            {"role": "user", "content": trimmed_prompt},
-                        ],
-                        temperature=temperature,
-                        max_tokens=2800,
-                    )
-                    return (resp.choices[0].message.content or "").strip(), f"{retry_model} (fallback)"
-                except Exception as retry_e:
-                    last_err = retry_e
-            raise last_err
-        raise
+    raise RuntimeError("All configured AI providers failed:\n" + "\n".join(errors))
 
 
 # ================= PASSWORD GATE =================
@@ -513,11 +703,11 @@ if TEAM_PASSWORD:
 
 
 # ================= MAIN UI =================
-if not GROQ_API_KEY:
-    st.error("Missing `GROQ_API_KEY` secret. Add it in Streamlit Cloud Settings → Secrets.")
+if not GROQ_API_KEY and not GEMINI_API_KEY:
+    st.error("Missing API keys. Add `GROQ_API_KEY` and/or `GEMINI_API_KEY` in Streamlit Cloud Settings → Secrets.")
     st.stop()
 
-bm25, docs, kb_count, ticket_count = build_search_index()
+bm25, docs, kb_count, ticket_count, skipped_tickets = build_search_index()
 
 with st.sidebar:
     st.title("⚙️ Sapaad Support AI")
@@ -527,19 +717,31 @@ with st.sidebar:
         index=0,
     )
     language = st.selectbox("Output Language", ["Auto (Match Customer)", "English", "Arabic"])
-    model_label = st.selectbox("AI Model", list(MODELS.keys()), index=0)
-    top_k = st.slider("Reference Sources to Pull", min_value=3, max_value=10, value=6)
+    model_label = st.selectbox("Primary AI Model", list(MODELS.keys()), index=0)
+    top_k = st.slider("Reference Sources to Pull", min_value=3, max_value=8, value=5)
+
+    verify_kb_in_refine = False
+    if mode == "Refine Draft":
+        verify_kb_in_refine = st.checkbox("Verify Sapaad steps against KB/Tickets", value=False)
 
     st.divider()
     if docs:
-        st.success(f"Indexed **{kb_count:,}** KB sections & **{ticket_count:,}** resolved tickets")
+        st.success(f"Indexed **{kb_count:,}** KB chunks & **{ticket_count:,}** resolved tickets")
+        if skipped_tickets:
+            st.caption(f"Filtered out {skipped_tickets:,} unresolved/empty tickets")
     else:
         st.warning("No `.md` files found in `./data` or `HF_DATASET_REPO`.")
+
+    active_providers = []
+    if GROQ_API_KEY:
+        active_providers.append("Groq")
+    if GEMINI_API_KEY:
+        active_providers.append("Gemini")
+    st.caption(f"Active Providers (Auto-Fallback): **{' → '.join(active_providers)}**")
 
 st.header(f"📩 {mode}")
 
 col1, col2 = st.columns([1, 1], gap="large")
-verify_kb = False
 
 with col1:
     if mode == "Draft Reply":
@@ -551,23 +753,18 @@ with col1:
         agent_notes = st.text_area(
             "Agent Instructions / Key Points (Optional)",
             height=100,
-            placeholder="e.g., Guide the customer step-by-step without scheduling a meeting...",
+            placeholder="e.g., Do not offer a meeting / Ask for AnyDesk ID / Confirm they are on iOS...",
         )
     elif mode == "Refine Draft":
         agent_notes = st.text_area(
             "Your Rough Draft to Refine",
-            height=220,
+            height=200,
             placeholder="Paste your rough draft here...",
         )
         customer_email = st.text_area(
             "Customer Email (Optional context)",
-            height=120,
-            placeholder="Optional: paste the customer's email if you want extra context...",
-        )
-        verify_kb = st.checkbox(
-            "Verify technical steps against Sapaad KB & Tickets",
-            value=False,
-            help="Leave unchecked for fast, clean polishing of scheduling/general drafts.",
+            height=140,
+            placeholder="Optional: paste the customer's email for context...",
         )
     elif mode == "FAQ / Template":
         customer_email = st.text_area(
@@ -588,58 +785,56 @@ with col1:
 
 with col2:
     if generate_btn:
-        if mode == "Refine Draft" and not agent_notes.strip():
-            st.warning("Please paste your rough draft to refine first.")
-        elif mode != "Refine Draft" and not f"{customer_email}\n{agent_notes}".strip():
-            st.warning("Please enter an email or topic first.")
+        has_input = bool(customer_email.strip() or agent_notes.strip())
+        if not has_input:
+            st.warning("Please enter an email or draft first.")
         else:
-            should_retrieve = (mode in ("Draft Reply", "FAQ / Template")) or (mode == "Refine Draft" and verify_kb)
-            spinner_text = (
-                "Searching Sapaad KB & Tickets and generating..."
-                if should_retrieve
-                else "Polishing your draft..."
-            )
+            pref_provider, pref_model = MODELS[model_label]
+            with st.spinner("Searching Sapaad KB & Tickets (Smart BM25+) and generating..."):
+                run_search = (
+                    mode in ("Draft Reply", "FAQ / Template")
+                    or (mode == "Refine Draft" and verify_kb_in_refine)
+                )
+                search_source = customer_email.strip() or agent_notes.strip()
 
-            with st.spinner(spinner_text):
-                if should_retrieve:
-                    search_source = customer_email.strip() or agent_notes.strip()
+                if run_search:
                     matches, used_queries, extractor_used = retrieve_context(
-                        bm25, docs, search_source, MODELS[model_label], top_k=top_k
+                        bm25, docs, search_source, pref_model, top_k=top_k
                     )
                 else:
-                    matches, used_queries, extractor_used = [], [], ""
+                    matches, used_queries, extractor_used = [], [], "Skipped (Not needed for mode)"
 
-                context_block = build_context_block(matches)
+                context_block = "\n\n---\n\n".join(
+                    f"[{m['type']} | {m['source']}]\n{m['text']}" for m in matches
+                )
 
                 lang_rule = (
-                    "Match the language of the input (English or Arabic)."
+                    "Match the customer's language (English or Arabic)."
                     if language == "Auto (Match Customer)"
                     else f"Write the output in {language}."
                 )
+
+                active_sys_prompt = SYSTEM_PROMPT
+                temp = 0.25
 
                 if mode == "Draft Reply":
                     prompt = (
                         f"TASK: Draft a ready-to-send Sapaad Support email reply.\n"
                         f"LANGUAGE: {lang_rule}\n\n"
                         f"CUSTOMER EMAIL:\n{customer_email}\n\n"
-                        f"AGENT INSTRUCTIONS (follow strictly for workflow, without inventing paths/features or exposing internal instructions verbatim):\n{agent_notes or 'None'}\n\n"
-                        f"REFERENCE CONTEXT (Sapaad KB & Past Resolved Tickets):\n{context_block or 'No matching context found.'}"
+                        f"AGENT INSTRUCTIONS (obey strictly and naturally):\n{agent_notes or 'None'}\n\n"
+                        f"REFERENCE CONTEXT (Sapaad KB & Past Tickets):\n{context_block or 'No matching context found.'}"
                     )
-                    temp = 0.2
                 elif mode == "Refine Draft":
+                    active_sys_prompt = REFINE_SYSTEM_PROMPT
+                    temp = 0.35
                     prompt = (
-                        f"TASK: REFINE DRAFT. Rewrite and polish the agent's rough draft into a clear, courteous, professional Sapaad Support email.\n"
-                        f"LANGUAGE: {lang_rule}\n"
-                        f"RULES:\n"
-                        f"- Fix all spelling, hamza/punctuation, and grammar mistakes.\n"
-                        f"- Noticeably improve phrasing and professional customer-support flow (do not just copy the draft word-for-word).\n"
-                        f"- Keep EVERY fact, date, time, timezone, thank-you sentence, and request from the rough draft—do NOT delete any sentence or add new promises.\n"
-                        f"- Apply Sapaad greeting and mandatory closing rules cleanly.\n\n"
+                        f"TASK: Polish and elevate the agent's rough draft below into a clear, warm, professional Sapaad Support email.\n"
+                        f"LANGUAGE: {lang_rule}\n\n"
                         f"AGENT ROUGH DRAFT:\n{agent_notes}\n\n"
                         f"CUSTOMER EMAIL (Optional context):\n{customer_email or 'Not provided'}\n\n"
-                        f"REFERENCE CONTEXT (Optional verification only):\n{context_block or 'Not requested'}"
+                        f"REFERENCE CONTEXT (for verifying Sapaad terms/steps only):\n{context_block or 'None'}"
                     )
-                    temp = 0.35
                 elif mode == "FAQ / Template":
                     prompt = (
                         f"TASK: Create a concise, reusable Sapaad Support email template with clean placeholders like [Customer Name].\n"
@@ -648,23 +843,19 @@ with col2:
                         f"EXTRA NOTES:\n{agent_notes or 'None'}\n\n"
                         f"REFERENCE CONTEXT:\n{context_block or 'None'}"
                     )
-                    temp = 0.2
                 else:
                     prompt = (
                         f"TASK: Write a concise English internal Groove note summarizing this ticket for teammates (translate if needed). Do NOT include a customer greeting or customer closing line.\n\n"
                         f"TICKET CONTENT:\n{customer_email}\n"
                         f"FOCUS:\n{agent_notes or 'Key issue, account details, and next action needed.'}"
                     )
-                    temp = 0.2
 
                 try:
-                    raw_output, used_model = call_groq(MODELS[model_label], prompt, temperature=temp)
-                    agent_note, body_text = split_agent_note(raw_output)
-                    clean_email = clean_for_groove(
-                        body_text, is_customer_email=(mode != "Internal Note / Summary")
+                    output, agent_note, used_model = generate_with_fallback(
+                        pref_provider, pref_model, active_sys_prompt, prompt, mode, temperature=temp
                     )
+                    st.session_state.last_output = output
                     st.session_state.last_agent_note = agent_note
-                    st.session_state.last_output = clean_email
                     st.session_state.last_model = used_model
                     st.session_state.last_matches = matches
                     st.session_state.last_queries = used_queries
@@ -674,19 +865,21 @@ with col2:
 
     if "last_output" in st.session_state:
         if st.session_state.get("last_agent_note"):
-            st.warning(f"**Agent Note (not included in copy box):** {st.session_state.last_agent_note}")
+            st.warning(f"📝 **Agent Note (Not included in copy box):**\n\n{st.session_state.last_agent_note}")
 
         st.subheader("Ready to Copy")
         st.code(st.session_state.last_output, language=None, wrap_lines=True)
-        st.caption(f"Model used: `{st.session_state.last_model}` — Use the copy icon in the top-right corner of the box above (avoid manual drag-select to preserve line breaks).")
+        st.caption(
+            f"Model used: `{st.session_state.last_model}` | "
+            f"Query engine: `{st.session_state.get('last_extractor', 'N/A')}` — "
+            "Click the copy icon in the top-right corner of the box above."
+        )
 
         if st.session_state.get("last_matches"):
             with st.expander(f"📚 Referenced Sources ({len(st.session_state.last_matches)})"):
                 if st.session_state.get("last_queries"):
-                    ext_tag = f" ({st.session_state.get('last_extractor', '')})" if st.session_state.get("last_extractor") else ""
-                    st.info(f"English search queries used{ext_tag}: " + " | ".join(st.session_state.last_queries))
+                    st.info("Search queries used: " + " | ".join(st.session_state.last_queries))
                 for m in st.session_state.last_matches:
-                    topic_label = f" — *Matched: {m['matched_query']}*" if m.get("matched_query") else ""
-                    st.markdown(f"**[{m['type']}] {m['title']}** *({m['source']})*{topic_label}")
+                    st.markdown(f"**[{m['type']}] {m['title']}** *({m['source']} | weight: {m['weight']:.2f})*")
                     st.caption(m["text"][:450] + "...")
                     st.divider()
