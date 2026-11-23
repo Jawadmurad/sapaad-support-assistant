@@ -1,10 +1,12 @@
 import glob
+import html as html_lib
 import json
 import os
 import re
 import urllib.error
 import urllib.request
 import streamlit as st
+import streamlit.components.v1 as components
 from groq import Groq
 from huggingface_hub import snapshot_download
 from rank_bm25 import BM25Okapi
@@ -71,7 +73,7 @@ SYSTEM_PROMPT = """You are a Sapaad Customer Support email assistant. Your job i
 - Use historical Groove tickets for real-world edge cases, troubleshooting workarounds, and Sapaad's standard support phrasing.
 - Prioritize recent tickets (2025–2026) over older tickets (2023–2024). Always recommend AnyDesk (never TeamViewer) for remote support, and use the current Cloud Print Agent link (prints.sapaad.com/getcpa).
 - NEVER invent or guess Sapaad menu paths (`>`), settings, or button names—not even for prerequisite steps (e.g., if the context mentions creating a surcharge without giving its exact menu path, state the prerequisite clearly without inventing a `>` path). ONLY include a `>` menu path if it explicitly appears in the REFERENCE CONTEXT below.
-- Always keep Sapaad UI menu paths and product names in their exact original English (e.g., Setup > Location Setup > Self Ordering Systems > Sapaad Direct) even when replying in Arabic, with ZERO mixed-script typos.
+- Always keep Sapaad UI menu paths and product names in their exact original English (e.g., **Setup > Location Setup > Self Ordering Systems > Sapaad Direct**) even when replying in Arabic, with ZERO mixed-script typos.
 - Do NOT assume the customer is on a "Lite" plan unless they explicitly say so; provide the standard setup steps first and mention plan tiers only as a brief note if relevant.
 - Factual accuracy ALWAYS overrides "guide alone" instructions: if a feature is unsupported or requires Sapaad backend action (such as open APIs or backend integrations), state that limitation clearly instead of inventing self-serve steps.
 - If the context does not clearly confirm an answer or requires account-level checking, add a short "[Agent Note: ...]" line at the very top BEFORE the email greeting.
@@ -84,7 +86,7 @@ SYSTEM_PROMPT = """You are a Sapaad Customer Support email assistant. Your job i
 - NEVER copy redacted placeholders ([PHONE_OR_ID], [EMAIL]), other customers' names, restaurant names, passwords, or expired Zoom/WeTransfer links from past tickets into a new draft.
 - Use clean bracketed placeholders like [Zoom Link] or [Date & Time] only if the agent hasn't provided them.
 
-4. TONE, LANGUAGE & FORMATTING
+4. TONE, LANGUAGE & RICH GROOVE FORMATTING
 - Always write in the "we" tone (representing the Sapaad Support Team), polite, clear, and concise.
 - Match the requested or customer's language (English or Arabic).
 - In Arabic replies, use consistent respectful plural addressing throughout (e.g., افتحوا، اختاروا، انتقلوا، اضغطوا، حرّروا، احفظوا، قوموا — never mix singular and plural verbs, and spell واختاروا correctly).
@@ -97,8 +99,11 @@ SYSTEM_PROMPT = """You are a Sapaad Customer Support email assistant. Your job i
   - Arabic: End every customer email with exactly:
     لا تترددوا بالتواصل معنا لأي مساعدة إضافية.
 - NO sign-off or signature: Never add "Best regards,", "Thanks,", or an agent name at the bottom (Groove appends the signature automatically).
-- For multi-part customer inquiries, use clean numbered points (1., 2., 3.) with consistent spacing and blank lines between points.
-- PLAIN TEXT ONLY: Never use Markdown formatting. Do NOT use **bold**, *italics*, ### headers, or backticks.
+- RICH FORMATTING FOR GROOVE (the app converts this cleanly into Groove rich text):
+  - Use **bold** professionally for Sapaad menu paths (e.g., **Setup > Location Setup**), button/option names, and short topic titles.
+  - Use clean numbered lists (`1.`, `2.`, `3.`) for multi-part answers or step-by-step instructions, and bullet points (`- `) for sub-items or feature lists.
+  - Use blank lines between paragraphs and sections for clean visual spacing.
+  - Do NOT use `#` / `###` Markdown headers, Markdown tables, or backticks (`).
 """
 
 REFINE_SYSTEM_PROMPT = """You are a senior Sapaad Customer Support editor. Your job is to polish and elevate an agent's rough draft into a clear, warm, professional Sapaad Support email ready to paste into Groove.
@@ -111,7 +116,8 @@ RULES:
 - Apply proper greeting ("Hi [Name]," / "Dear [Name]," / "السلام عليكم،") and the exact mandatory closing line once at the end:
   - English: Please feel free to write to us for any further assistance.
   - Arabic: لا تترددوا بالتواصل معنا لأي مساعدة إضافية.
-- NO sign-off ("Best regards,", agent name) and NO Markdown formatting (**bold**, ###, backticks). Plain text only.
+- Use clean **bold** for key details (like dates, menu paths, or meeting labels), numbered lists (`1.`, `2.`) or bullet points (`- `) where helpful, and blank lines between paragraphs.
+- NO sign-off ("Best regards,", agent name), NO `###` headers, and NO backticks.
 """
 
 
@@ -340,7 +346,6 @@ def build_search_index():
                     body = parts[i + 1].strip() if i + 1 < len(parts) else ""
                     if len(body) < 35:
                         continue
-                    # Skip file-level table of contents / metadata blocks
                     if "Total Articles:" in body[:250] or "Consolidated Knowledge Base" in body[:250]:
                         continue
 
@@ -348,7 +353,6 @@ def build_search_index():
                         chunk_title = title if c_idx == 0 else f"{title} (Part {c_idx + 1})"
                         clean_title = clean_for_index(title)
                         clean_body = clean_for_index(chunk)
-                        # BM25F-style boost: KB Title 3x
                         indexed_text = f"{clean_title} {clean_title} {clean_title} {clean_body}"
 
                         docs.append({
@@ -460,10 +464,8 @@ def should_bypass_llm_extraction(text: str) -> bool:
     stripped = text.strip()
     if not stripped or len(stripped) > 350:
         return False
-    # Never bypass if Arabic characters are present (needs cross-language translation)
     if re.search(r"[\u0600-\u06FF]", stripped):
         return False
-    # Never bypass multi-part numbered/bulleted emails or multiple questions
     bullet_lines = re.findall(r"(?m)^\s*(?:\d+[\.\)]|[-•*])\s+", stripped)
     if len(bullet_lines) >= 2 or stripped.count("?") >= 2:
         return False
@@ -477,7 +479,6 @@ def extract_english_subqueries(text: str, draft_model_id: str) -> tuple[list[str
         cleaned = expand_synonyms(clean_for_index(text))
         return [cleaned], "Smart Bypass (0 tokens)"
 
-    # Prefer a model different from the drafting model to avoid Groq TPM collisions
     chain = [item for item in EXTRACTOR_CHAIN if item[1] != draft_model_id] + [
         item for item in EXTRACTOR_CHAIN if item[1] == draft_model_id
     ]
@@ -511,7 +512,6 @@ def extract_english_subqueries(text: str, draft_model_id: str) -> tuple[list[str
             lines = []
             for ln in raw.splitlines():
                 cleaned = re.sub(r"^[\d\.\-\•\*\s]+", "", ln).strip()
-                # Filter out broken 1-word fragments and non-English lines
                 if cleaned and len(cleaned.split()) >= 2 and re.search(r"[a-zA-Z]{2,}", cleaned):
                     lines.append(expand_synonyms(cleaned))
             if lines:
@@ -551,11 +551,9 @@ def retrieve_context(bm25, docs, query: str, draft_model_id: str, top_k: int = 6
         ]
         scored.sort(reverse=True)
 
-        # Accumulate RRF score across all subqueries
         for rank, (_, idx) in enumerate(scored[:25], start=1):
             rrf_scores[idx] = rrf_scores.get(idx, 0.0) + (1.0 / (k_rrf + rank))
 
-        # For multi-topic emails, guarantee the #1 match for EACH distinct topic
         if is_multi_topic and scored:
             for _, idx in scored[:5]:
                 if idx not in seen_priority:
@@ -565,7 +563,6 @@ def retrieve_context(bm25, docs, query: str, draft_model_id: str, top_k: int = 6
 
     rrf_ranked = [idx for idx, _ in sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)]
 
-    # Assemble final list: per-topic top matches first, then RRF-ranked backfill with KB/Ticket balance
     selected = []
     seen = set()
     total_chars = 0
@@ -592,31 +589,27 @@ def retrieve_context(bm25, docs, query: str, draft_model_id: str, top_k: int = 6
             ticket_count += 1
         return True
 
-    # Pass 1: Guaranteed top match per topic (for multi-point emails)
     for idx in per_topic_priority:
         if len(selected) >= max_docs:
             break
         try_add(idx, enforce_kb_cap=False)
 
-    # Pass 2: RRF ranked fill (balanced KB + Tickets)
     for idx in rrf_ranked:
         if len(selected) >= max_docs:
             break
         try_add(idx, enforce_kb_cap=True)
 
-    # Pass 3: Backfill without KB cap if still under top_k
     if len(selected) < top_k:
         for idx in rrf_ranked:
             if len(selected) >= top_k:
                 break
             try_add(idx, enforce_kb_cap=False)
 
-    # Clean display queries (hide appended synonym tails in UI)
     display_queries = [q[:90] + ("..." if len(q) > 90 else "") for q in subqueries]
     return selected, display_queries, extractor_used
 
 
-# ================= OUTPUT CLEANING & AGENT NOTE SEPARATION =================
+# ================= OUTPUT CLEANING & GROOVE RICH HTML CONVERTER =================
 def extract_agent_note(text: str) -> tuple[str, str]:
     """Separate any [Agent Note: ...] lines so Ready to Copy is 100% customer-safe."""
     notes = re.findall(r"(?i)\[Agent Note:\s*([^\]]+)\]", text)
@@ -626,10 +619,9 @@ def extract_agent_note(text: str) -> tuple[str, str]:
 
 
 def clean_for_groove(text: str, mode: str) -> str:
-    """Strip Markdown, fix mixed-script/Arabic slips, and guarantee clean Groove spacing."""
-    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
-    text = re.sub(r"__(.*?)__", r"\1", text)
-    text = re.sub(r"(?m)^#{1,6}\s+", "", text)
+    """Keep clean bold/lists/linebreaks for Groove rich text, while fixing headers/typos."""
+    # Convert ### headers to bold lines instead of raw hashes
+    text = re.sub(r"(?m)^#{1,6}\s+(.+)$", r"**\1**", text)
     text = re.sub(r"`([^`]+)`", r"\1", text)
 
     # Fix common mixed-script and Arabic spelling slips
@@ -637,7 +629,7 @@ def clean_for_groove(text: str, mode: str) -> str:
     text = text.replace("واختروا", "واختاروا")
     text = text.replace("حرّرو ", "حرّروا ").replace("قموا ", "قوموا ")
 
-    # Normalize spacing
+    # Normalize spacing while preserving intentional blank lines
     text = re.sub(r"[ \t]+\n", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     text = text.strip()
@@ -649,6 +641,278 @@ def clean_for_groove(text: str, mode: str) -> str:
             text = f"السلام عليكم،\n\n{text}"
 
     return text
+
+
+def strip_markdown_plain(text: str) -> str:
+    """Create a clean plain-text fallback version (without ** markers)."""
+    plain = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
+    plain = re.sub(r"__(.*?)__", r"\1", plain)
+    plain = re.sub(r"(?<!\*)\*(?!\*)(.*?)(?<!\*)\*(?!\*)", r"\1", plain)
+    return plain.strip()
+
+
+def _format_inline_html(line: str) -> str:
+    """Convert inline Markdown (**bold**, *italic*, URLs) to Groove-safe HTML."""
+    escaped = html_lib.escape(line)
+    # Bold: **text** or __text__
+    escaped = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped)
+    escaped = re.sub(r"__(.+?)__", r"<strong>\1</strong>", escaped)
+    # Italic: *text* (avoid matching inside URLs or spaces)
+    escaped = re.sub(r"(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)", r"<em>\1</em>", escaped)
+    # Auto-link URLs cleanly
+    escaped = re.sub(
+        r"(https?://[^\s<]+?)(?=[.,;:!?)]*(?:\s|$|<))",
+        r'<a href="\1" target="_blank" rel="noopener noreferrer">\1</a>',
+        escaped,
+    )
+    return escaped
+
+
+def markdown_to_groove_html(text: str) -> str:
+    """
+    Convert structured Markdown into TinyMCE / Groove-native HTML:
+    - Uses <div> and <div><br></div> so Groove preserves every single line break!
+    - Uses <strong>, <ol>, <ul>, <li>, <a> cleanly with zero background-color leakage.
+    """
+    lines = text.splitlines()
+    out = []
+    in_ol = False
+    in_ul = False
+    pending_blank = False
+
+    def close_lists():
+        nonlocal in_ol, in_ul
+        if in_ul:
+            out.append("</ul>")
+            in_ul = False
+        if in_ol:
+            out.append("</ol>")
+            in_ol = False
+
+    for raw_line in lines:
+        line = raw_line.strip()
+
+        if not line:
+            close_lists()
+            if out:
+                pending_blank = True
+            continue
+
+        ol_match = re.match(r"^(\d+)[\.\)]\s+(.+)$", line)
+        ul_match = re.match(r"^[-•*]\s+(.+)$", line)
+
+        if ol_match:
+            num = int(ol_match.group(1))
+            content = _format_inline_html(ol_match.group(2))
+            if in_ul:
+                out.append("</ul>")
+                in_ul = False
+            if pending_blank and out:
+                out.append("<div><br></div>")
+                pending_blank = False
+            if not in_ol:
+                start_attr = f' start="{num}"' if num != 1 else ""
+                out.append(f"<ol{start_attr}>")
+                in_ol = True
+            out.append(f"<li>{content}</li>")
+
+        elif ul_match:
+            content = _format_inline_html(ul_match.group(1))
+            if in_ol:
+                out.append("</ol>")
+                in_ol = False
+            if pending_blank and out:
+                out.append("<div><br></div>")
+                pending_blank = False
+            if not in_ul:
+                out.append("<ul>")
+                in_ul = True
+            out.append(f"<li>{content}</li>")
+
+        else:
+            close_lists()
+            if pending_blank and out:
+                out.append("<div><br></div>")
+                pending_blank = False
+            out.append(f"<div>{_format_inline_html(line)}</div>")
+
+    close_lists()
+    return "\n".join(out)
+
+
+def render_groove_copy_box(markdown_text: str):
+    """Render a white-paper rich-text email preview with 1-click Groove Rich-Text & Plain-Text Copy."""
+    groove_html = markdown_to_groove_html(markdown_text)
+    plain_text = strip_markdown_plain(markdown_text)
+    is_rtl = bool(re.search(r"[\u0600-\u06FF]", markdown_text))
+    dir_attr = "rtl" if is_rtl else "ltr"
+    align_css = "right" if is_rtl else "left"
+
+    # Estimate iframe height smoothly based on content length
+    line_count = max(8, markdown_text.count("\n") + len(markdown_text) // 75 + 4)
+    iframe_height = min(680, max(260, line_count * 24 + 90))
+
+    plain_json = json.dumps(plain_text)
+
+    component_html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+    <meta charset="utf-8" />
+    <style>
+      * {{ box-sizing: border-box; }}
+      body {{
+        margin: 0;
+        padding: 0;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+        background: transparent;
+      }}
+      .toolbar {{
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        margin-bottom: 10px;
+        flex-wrap: wrap;
+      }}
+      .btn {{
+        border: none;
+        border-radius: 6px;
+        padding: 8px 14px;
+        font-size: 13px;
+        font-weight: 600;
+        cursor: pointer;
+        transition: all 0.15s ease;
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+      }}
+      .btn-primary {{
+        background: #ff4b4b;
+        color: #ffffff;
+      }}
+      .btn-primary:hover {{ background: #e03e3e; }}
+      .btn-secondary {{
+        background: #2b313e;
+        color: #f3f4f6;
+        border: 1px solid #444c5c;
+      }}
+      .btn-secondary:hover {{ background: #3b4252; }}
+      .status {{
+        font-size: 12.5px;
+        font-weight: 600;
+        color: #10b981;
+        margin-left: 4px;
+      }}
+      .paper {{
+        background-color: #ffffff;
+        color: #1f2937;
+        border: 1px solid #d1d5db;
+        border-radius: 8px;
+        padding: 18px 20px;
+        max-height: {iframe_height - 62}px;
+        overflow-y: auto;
+        font-size: 14px;
+        line-height: 1.65;
+        direction: {dir_attr};
+        text-align: {align_css};
+      }}
+      #groove-preview div {{
+        margin: 0;
+      }}
+      #groove-preview ol, #groove-preview ul {{
+        margin: 4px 0 8px 0;
+        padding-inline-start: 22px;
+      }}
+      #groove-preview li {{
+        margin-bottom: 4px;
+      }}
+      #groove-preview a {{
+        color: #2563eb;
+        text-decoration: underline;
+      }}
+    </style>
+    </head>
+    <body>
+      <div class="toolbar">
+        <button class="btn btn-primary" onclick="copyRich()">📋 Copy Formatted for Groove</button>
+        <button class="btn btn-secondary" onclick="copyPlain()">📄 Copy Plain Text</button>
+        <span id="copy-status" class="status"></span>
+      </div>
+      <div class="paper">
+        <div id="groove-preview" dir="{dir_attr}">{groove_html}</div>
+      </div>
+
+      <script>
+        const PLAIN_TEXT = {plain_json};
+
+        function showStatus(msg) {{
+          const el = document.getElementById("copy-status");
+          el.textContent = msg;
+          setTimeout(() => {{ el.textContent = ""; }}, 2600);
+        }}
+
+        async function copyRich() {{
+          const preview = document.getElementById("groove-preview");
+          const htmlData = preview.innerHTML;
+          let success = false;
+
+          // Tier 1: Modern ClipboardItem API (writes clean text/html + text/plain)
+          if (navigator.clipboard && window.ClipboardItem) {{
+            try {{
+              const item = new ClipboardItem({{
+                "text/html": new Blob([htmlData], {{ type: "text/html" }}),
+                "text/plain": new Blob([PLAIN_TEXT], {{ type: "text/plain" }})
+              }});
+              await navigator.clipboard.write([item]);
+              success = true;
+            }} catch (e) {{
+              success = false;
+            }}
+          }}
+
+          // Tier 2: DOM Selection + execCommand('copy') fallback (works reliably in iframes)
+          if (!success) {{
+            try {{
+              const range = document.createRange();
+              range.selectNodeContents(preview);
+              const sel = window.getSelection();
+              sel.removeAllRanges();
+              sel.addRange(range);
+              success = document.execCommand("copy");
+              sel.removeAllRanges();
+            }} catch (e) {{
+              success = false;
+            }}
+          }}
+
+          showStatus(success ? "✅ Copied with formatting! Paste directly into Groove." : "⚠️ Please press Ctrl+A then Ctrl+C inside the box.");
+        }}
+
+        async function copyPlain() {{
+          let success = false;
+          if (navigator.clipboard && navigator.clipboard.writeText) {{
+            try {{
+              await navigator.clipboard.writeText(PLAIN_TEXT);
+              success = true;
+            }} catch (e) {{
+              success = false;
+            }}
+          }}
+          if (!success) {{
+            const ta = document.createElement("textarea");
+            ta.value = PLAIN_TEXT;
+            document.body.appendChild(ta);
+            ta.select();
+            success = document.execCommand("copy");
+            document.body.removeChild(ta);
+          }}
+          showStatus(success ? "✅ Plain text copied!" : "⚠️ Copy failed.");
+        }}
+      </script>
+    </body>
+    </html>
+    """
+    components.html(component_html, height=iframe_height, scrolling=False)
 
 
 def generate_with_fallback(
@@ -685,20 +949,50 @@ def generate_with_fallback(
     raise RuntimeError("All configured AI providers failed:\n" + "\n".join(errors))
 
 
-# ================= PASSWORD GATE =================
+# ================= PASSWORD GATE (ENTER KEY + BROWSER SAVE + EYE ICON) =================
 if TEAM_PASSWORD:
     if "authenticated" not in st.session_state:
         st.session_state.authenticated = False
 
     if not st.session_state.authenticated:
-        st.title("🔒 Sapaad Support AI Assistant")
-        pwd = st.text_input("Enter Team Password", type="password")
-        if st.button("Login", type="primary"):
-            if pwd == TEAM_PASSWORD:
-                st.session_state.authenticated = True
-                st.rerun()
-            else:
-                st.error("Incorrect password.")
+        st.markdown(
+            """
+            <style>
+            /* Make the built-in password eye icon crisp and clearly visible */
+            button[title="Show password text"],
+            button[title="Hide password text"],
+            [data-testid="stTextInput"] button {
+                opacity: 0.92 !important;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        _, center_col, _ = st.columns([1, 1.4, 1])
+        with center_col:
+            st.title("🔒 Sapaad Support AI Assistant")
+            with st.form("team_login_form", clear_on_submit=False):
+                st.text_input(
+                    "Team Account",
+                    value="sapaad-support",
+                    autocomplete="username",
+                    help="Used by your browser Password Manager so it offers to save your login.",
+                )
+                pwd = st.text_input(
+                    "Team Password",
+                    type="password",
+                    autocomplete="current-password",
+                    placeholder="Enter team password and press Enter...",
+                )
+                submitted = st.form_submit_button("Login", type="primary", use_container_width=True)
+
+            if submitted:
+                if pwd == TEAM_PASSWORD:
+                    st.session_state.authenticated = True
+                    st.rerun()
+                else:
+                    st.error("Incorrect password.")
         st.stop()
 
 
@@ -868,11 +1162,10 @@ with col2:
             st.warning(f"📝 **Agent Note (Not included in copy box):**\n\n{st.session_state.last_agent_note}")
 
         st.subheader("Ready to Copy")
-        st.code(st.session_state.last_output, language=None, wrap_lines=True)
+        render_groove_copy_box(st.session_state.last_output)
         st.caption(
             f"Model used: `{st.session_state.last_model}` | "
-            f"Query engine: `{st.session_state.get('last_extractor', 'N/A')}` — "
-            "Click the copy icon in the top-right corner of the box above."
+            f"Query engine: `{st.session_state.get('last_extractor', 'N/A')}`"
         )
 
         if st.session_state.get("last_matches"):
