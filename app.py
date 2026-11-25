@@ -42,6 +42,28 @@ CF_API_TOKEN = get_secret("CF_API_TOKEN")
 LOCAL_DATA_DIR = "data"
 
 MAX_CONTEXT_CHARS = 10800
+def build_budgeted_context(matches: list[dict], customer_email: str, agent_notes: str, language: str) -> str:
+    """Dynamically cap retrieved context based on Arabic vs English token density (~2.2 vs ~3.8 chars/token)."""
+    combined_in = f"{customer_email}\n{agent_notes}"
+    has_arabic = language == "Arabic" or bool(re.search(r"[\u0600-\u06FF]", combined_in))
+
+    # Reserve headroom on Groq's 8,000 TPM free tier when input/output contains Arabic tokens
+    char_budget = 6800 if has_arabic else MAX_CONTEXT_CHARS
+    per_doc_cap = 1350 if has_arabic else 2200
+
+    chunks = []
+    used_chars = 0
+    for m in matches:
+        body = m["text"][:per_doc_cap]
+        snippet = f"[{m['type']} | {m['source']}]\n{body}"
+        if used_chars + len(snippet) > char_budget:
+            remaining = char_budget - used_chars
+            if remaining > 350:
+                chunks.append(snippet[:remaining] + "...")
+            break
+        chunks.append(snippet)
+        used_chars += len(snippet) + 8
+    return "\n\n---\n\n".join(chunks)
 
 MODELS = {
     "Groq: GPT-OSS 120B (Best Quality)": ("groq", "openai/gpt-oss-120b"),
@@ -696,7 +718,7 @@ with col2:
                 else:
                     matches, search_meta = [], {}
 
-                context_chunks = []
+                context_block = build_budgeted_context(matches, customer_email, agent_notes, language)
                 used_chars = 0
                 for m in matches:
                     snippet = f"[{m['type']} | {m['source']}]\n{m['text']}"
@@ -820,3 +842,4 @@ with col2:
                     st.markdown(f"**[{m['type']}] {m['title']}** *({m['source']})*{matched_tag}")
                     st.caption(m["text"][:450] + ("..." if len(m["text"]) > 450 else ""))
                     st.divider()
+
