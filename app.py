@@ -725,6 +725,7 @@ with col2:
                     if used_chars + len(snippet) > MAX_CONTEXT_CHARS:
                         remaining = MAX_CONTEXT_CHARS - used_chars
                         if remaining > 350:
+                            context_chunks = []
                             context_chunks.append(snippet[:remaining] + "...")
                         break
                     context_chunks.append(snippet)
@@ -842,4 +843,5 @@ with col2:
                     st.markdown(f"**[{m['type']}] {m['title']}** *({m['source']})*{matched_tag}")
                     st.caption(m["text"][:450] + ("..." if len(m["text"]) > 450 else ""))
                     st.divider()
+
 
