@@ -9,6 +9,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 from groq import Groq
 
+from privacy import restore_pii, scrub_pii
 from retrieval import (
     build_search_index as _build_retrieval_index,
     retrieve_context as _smart_retrieve_context,
@@ -49,7 +50,6 @@ def build_budgeted_context(matches: list[dict], customer_email: str, agent_notes
     combined_in = f"{customer_email}\n{agent_notes}"
     has_arabic = language == "Arabic" or bool(re.search(r"[\u0600-\u06FF]", combined_in))
 
-    # Reserve headroom on Groq's 8,000 TPM free tier when input/output contains Arabic tokens
     char_budget = 6800 if has_arabic else MAX_CONTEXT_CHARS
     per_doc_cap = 1350 if has_arabic else 2200
 
@@ -85,11 +85,13 @@ SYSTEM_PROMPT = """You are a Sapaad Customer Support email assistant. Your job i
 - Prioritize recent tickets (2025–2026) over older tickets (2023–2024). Always recommend AnyDesk (never TeamViewer) for remote support, and use the current Cloud Print Agent link (prints.sapaad.com/getcpa).
 - NEVER invent or guess Sapaad menu paths, settings, or button names—not even for prerequisite steps (such as adding a surcharge). ONLY include a `>` menu path if that exact path appears in the REFERENCE CONTEXT below.
 - Always keep Sapaad UI menu paths in their original English (e.g., **Setup > Location Setup > Self Ordering Systems > Sapaad Direct**) even when replying in Arabic, because the Sapaad interface is in English. Never mix Arabic and English characters inside the same word (e.g., never write "Sapaاد").
+- If PREVIOUS REPLIES / ALREADY TRIED steps are provided, NEVER ask the customer to repeat troubleshooting steps they have already completed—acknowledge them and move straight to the next step or remote assistance.
 - Obey AGENT INSTRUCTIONS strictly regarding how to handle the customer (e.g., whether to promise a callback/account check or guide them step-by-step), while keeping the tone warm and polite—never leak harsh internal phrasing to the customer. However, factual accuracy ALWAYS overrides self-serve instructions: if a detail is not in the REFERENCE CONTEXT, do NOT fabricate steps.
 - If the context does not clearly confirm an answer or requires account-level checking, add a short `[Agent Note: ...]` line at the very top BEFORE the greeting explaining what the agent should verify internally, and keep the email body polite and accurate.
 
 2. PRIVACY & PLACEHOLDER SAFETY
-- NEVER copy redacted placeholders ([PHONE_OR_ID], [EMAIL]), other customers' names, restaurant names, passwords, or expired Zoom/WeTransfer links from past tickets into a new draft.
+- Preserve any `[CUST_EMAIL_1]` or `[CUST_PHONE_1]` tokens from the customer's email verbatim if referencing their contact details (they are restored locally after generation).
+- NEVER copy redacted dataset placeholders ([PHONE_OR_ID], [EMAIL]), other customers' names, restaurant names, passwords, or expired Zoom/WeTransfer links from past tickets into a new draft.
 - Use clean bracketed placeholders like [Zoom Link] or [Date & Time] only if the agent hasn't provided them.
 
 3. TONE, LANGUAGE & GROOVE FORMATTING
@@ -113,16 +115,15 @@ SYSTEM_PROMPT = """You are a Sapaad Customer Support email assistant. Your job i
   - NEVER use Markdown headers (###), code blocks, backticks (`), or tables.
 """
 
-REFINE_SYSTEM_PROMPT = """You are a senior Sapaad Customer Support editor refining an agent's rough email draft for Groove.
+REFINE_SYSTEM_PROMPT = """You are a senior Sapaad Customer Support editor refining or transforming an agent's email draft for Groove.
 
 RULES:
-- Preserve EVERY fact, date, time, link, placeholder, thank-you line, and commitment from the agent's rough draft. Do NOT drop details or add new promises.
+- Preserve EVERY fact, date, time, link, placeholder, Sapaad UI path, and commitment unless explicitly asked to shorten or convert to an internal note. Do NOT invent new Sapaad steps or promises.
 - Significantly elevate clarity, grammar, flow, and polite Sapaad Support "we" tone.
-- Match the language of the rough draft (or the requested output language).
+- Keep Sapaad UI menu paths in their original English (e.g., **Setup > Location Setup**) even when translating to Arabic.
 - For Arabic drafts, use natural, professional business Arabic with consistent respectful plural addressing (قوموا، اختاروا، تواصلوا).
-- Apply Sapaad greeting rules ("Hi [Name]," / "Dear [Name]," / "السلام عليكم،") and the exact mandatory closing line once ("Please feel free to write to us for any further assistance." or "لا تترددوا بالتواصل معنا لأي مساعدة إضافية."). Never add a sign-off or agent signature.
+- For customer emails, apply Sapaad greeting rules ("Hi [Name]," / "Dear [Name]," / "السلام عليكم،") and the exact mandatory closing line once ("Please feel free to write to us for any further assistance." or "لا تترددوا بالتواصل معنا لأي مساعدة إضافية."). Never add a sign-off or agent signature.
 - Use clean **bold** for key paths/dates/actions and clean numbered or bulleted lists where helpful. Never use ### headers, backticks, or tables.
-- If REFERENCE CONTEXT is provided, verify Sapaad UI menu paths against it and keep UI paths in English.
 """
 
 
@@ -296,7 +297,7 @@ def extract_english_subqueries(
 
 
 # ================= POST-PROCESSING & GROOVE HTML CONVERTER =================
-def split_agent_note_and_clean(text: str, mode: str, language_choice: str, customer_email: str) -> tuple[str, str]:
+def split_agent_note_and_clean(text: str, mode: str, language_choice: str) -> tuple[str, str]:
     """Separate [Agent Note: ...] from the email body and apply Groove formatting safety guards."""
     text = text.strip()
     agent_notes = []
@@ -309,7 +310,6 @@ def split_agent_note_and_clean(text: str, mode: str, language_choice: str, custo
 
     text = re.sub(r"(?im)^\s*\[?Agent Note\s*:\s*([^\n\]]+)\]?\s*\n*", _collect_note, text)
 
-    # Strip unwanted Markdown syntax while preserving **bold** and lists for Groove TinyMCE
     text = re.sub(r"(?m)^#{1,6}\s+", "", text)
     text = re.sub(r"```[a-zA-Z]*\n?", "", text)
     text = re.sub(r"`([^`]+)`", r"\1", text)
@@ -317,12 +317,10 @@ def split_agent_note_and_clean(text: str, mode: str, language_choice: str, custo
     text = re.sub(r"[ \t]+\n", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
 
-    # Catch rare mixed-script & Arabic spelling slips
     text = re.sub(r"Sapa[\u0600-\u06FF]+", "Sapaad", text)
     text = text.replace("واختروا", "واختاروا").replace("قموا", "قوموا")
     text = text.strip()
 
-    # Guarantee Arabic greeting on customer-facing Arabic drafts
     if mode != "Internal Note / Summary":
         is_arabic_output = (
             language_choice == "Arabic"
@@ -335,7 +333,6 @@ def split_agent_note_and_clean(text: str, mode: str, language_choice: str, custo
 
 
 def _format_inline_html(escaped_text: str) -> str:
-    """Convert **bold** and bare URLs inside already-escaped text to Groove TinyMCE HTML."""
     formatted = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped_text)
     formatted = re.sub(
         r"(https?://[^\s<]+)",
@@ -346,11 +343,10 @@ def _format_inline_html(escaped_text: str) -> str:
 
 
 def markdown_to_groove_html(text: str) -> tuple[str, str, bool]:
-    """Convert draft into TinyMCE-compatible HTML (<div>, <div><br></div>, <strong>, <ol>, <ul>) + clean plain text."""
     is_rtl = bool(re.search(r"[\u0600-\u06FF]", text))
     lines = text.splitlines()
     html_parts = []
-    in_list = None  # "ol" or "ul"
+    in_list = None
 
     def close_list():
         nonlocal in_list
@@ -403,7 +399,6 @@ def markdown_to_groove_html(text: str) -> tuple[str, str, bool]:
 
 
 def render_groove_preview_and_copy(draft_text: str):
-    """Render white-background email preview + one-click TinyMCE HTML & Plain Text copy buttons."""
     groove_html, plain_text, is_rtl = markdown_to_groove_html(draft_text)
     groove_html_js = json.dumps(groove_html)
     plain_text_js = json.dumps(plain_text)
@@ -551,6 +546,82 @@ def render_groove_preview_and_copy(draft_text: str):
     components.html(component_html, height=box_height, scrolling=False)
 
 
+# ================= ONE-CLICK POST-DRAFT ACTION HELPER =================
+def apply_quick_action(action_key: str, primary_provider: str, primary_model: str):
+    """Transform the current draft in 1 click without re-running retrieval."""
+    current_draft = st.session_state.get("last_output", "")
+    if not current_draft:
+        return
+
+    is_currently_arabic = bool(re.search(r"[\u0600-\u06FF]", current_draft))
+    target_mode = "Draft Reply"
+    target_lang = "Auto (Match Customer)"
+
+    if action_key == "shorten":
+        instruction = (
+            "Make this email significantly shorter, punchier, and easier to scan—keep only the essential steps, "
+            "Sapaad UI paths, and links without losing factual accuracy."
+        )
+    elif action_key == "deescalate":
+        instruction = (
+            "Rewrite with warm empathy and calm de-escalation at the opening—acknowledge the customer's frustration "
+            "sincerely while keeping every technical step and commitment accurate."
+        )
+    elif action_key == "anydesk":
+        instruction = (
+            "Keep the existing reply intact and add a polite paragraph offering remote assistance via **AnyDesk** "
+            "(include download link [https://anydesk.com/en/downloads/windows](https://anydesk.com/en/downloads/windows) and ask for their AnyDesk ID and preferred time)."
+        )
+    elif action_key == "translate":
+        if is_currently_arabic:
+            target_lang = "English"
+            instruction = (
+                "Translate this Sapaad Support reply into polished, natural English while keeping all Sapaad UI paths, "
+                "links, and facts identical."
+            )
+        else:
+            target_lang = "Arabic"
+            instruction = (
+                "Translate this Sapaad Support reply into polished, natural business Arabic using respectful plural "
+                "addressing (قوموا، اختاروا، اضغطوا، تواصلوا), while keeping all Sapaad UI paths in English."
+            )
+    else:  # internal_note
+        target_mode = "Internal Note / Summary"
+        target_lang = "English"
+        instruction = (
+            "Convert this draft into a concise 3-5 bullet English internal Groove note for teammates summarizing "
+            "what was explained/promised and any next action needed. Remove customer greeting and customer closing."
+        )
+
+    scrubbed_list, pii_map = scrub_pii([current_draft])
+    prompt = (
+        f"TASK: {instruction}\n\n"
+        f"CURRENT DRAFT:\n{scrubbed_list[0]}"
+    )
+
+    with st.spinner("Applying quick refinement..."):
+        raw_out, used_model = call_llm(
+            primary_provider=primary_provider,
+            primary_model=primary_model,
+            system_prompt=REFINE_SYSTEM_PROMPT,
+            user_prompt=prompt,
+            temperature=0.25,
+            max_tokens=2400,
+        )
+        _, cleaned = split_agent_note_and_clean(raw_out, target_mode, target_lang)
+        audit_report = verify_and_repair_draft(
+            draft_text=cleaned,
+            context_block=st.session_state.get("last_context_block", ""),
+            mode=target_mode,
+            language_choice=target_lang,
+            customer_email=st.session_state.get("last_customer_email", ""),
+            agent_notes=st.session_state.get("last_agent_notes", ""),
+        )
+        st.session_state.last_output = restore_pii(audit_report["draft"], pii_map)
+        st.session_state.last_audit = audit_report
+        st.session_state.last_model = used_model
+
+
 # ================= PASSWORD GATE (ENTER SUBMIT + PASSWORD MANAGER + EYE ICON) =================
 if TEAM_PASSWORD:
     if "authenticated" not in st.session_state:
@@ -640,6 +711,7 @@ with st.sidebar:
     if GEMINI_API_KEY:
         active_provs.append("Gemini")
     st.caption(f"Active Providers (Auto-Fallback): **{' → '.join(active_provs)}**")
+    st.caption("Privacy Shield: **Client-Side PII Scrubber ON**")
 
 st.header(f"📩 {mode}")
 
@@ -647,15 +719,22 @@ col1, col2 = st.columns([1, 1], gap="large")
 
 with col1:
     verify_kb_in_refine = False
+    previous_replies = ""
     if mode == "Draft Reply":
         customer_email = st.text_area(
             "Paste Customer Email",
-            height=250,
+            height=230,
             placeholder="Paste the full customer email from Groove here...",
         )
+        with st.expander("💬 Previous Replies / Already Tried (Optional)"):
+            previous_replies = st.text_area(
+                "Paste earlier thread replies or steps customer already tried",
+                height=110,
+                placeholder="e.g., Customer already cleared browser cache, restarted router, and reinstalled CPA...",
+            )
         agent_notes = st.text_area(
             "Agent Instructions / Key Points (Optional)",
-            height=105,
+            height=100,
             placeholder="e.g., Ask if they are using Android or iOS / Tell them we tried calling and need AnyDesk ID...",
         )
     elif mode == "Refine Draft":
@@ -691,16 +770,22 @@ with col1:
     generate_btn = st.button("✨ Generate", type="primary", use_container_width=True)
 
 with col2:
+    primary_provider, primary_model = available_models[model_label]
+
     if generate_btn:
-        search_source = (
+        raw_search_source = (
             (customer_email.strip() or agent_notes.strip())
             if mode != "Refine Draft"
             else f"{agent_notes}\n{customer_email}".strip()
         )
-        if not search_source:
+        if not raw_search_source:
             st.warning("Please enter an email or draft first.")
         else:
-            primary_provider, primary_model = available_models[model_label]
+            # Scrub customer emails/phones locally BEFORE any external API call (Cloudflare, Groq, Gemini)
+            [safe_email, safe_notes, safe_prev, safe_search], pii_map = scrub_pii(
+                [customer_email, agent_notes, previous_replies, raw_search_source]
+            )
+
             should_search = (
                 mode in ("Draft Reply", "FAQ / Template")
                 or (mode == "Refine Draft" and verify_kb_in_refine)
@@ -710,7 +795,7 @@ with col2:
                 if should_search:
                     matches, search_meta = _smart_retrieve_context(
                         index_bundle=index_bundle,
-                        query=search_source,
+                        query=safe_search,
                         extract_subqueries_fn=lambda txt: extract_english_subqueries(
                             txt, primary_provider, primary_model
                         ),
@@ -721,7 +806,7 @@ with col2:
                 else:
                     matches, search_meta = [], {}
 
-                context_block = build_budgeted_context(matches, customer_email, agent_notes, language)
+                context_block = build_budgeted_context(matches, safe_email, safe_notes, language)
 
                 lang_rule = (
                     "Match the customer's language (English or Arabic)."
@@ -733,12 +818,18 @@ with col2:
                 temp = 0.22
 
                 if mode == "Draft Reply":
+                    prev_section = (
+                        f"PREVIOUS REPLIES / ALREADY TRIED (do NOT repeat these steps):\n{safe_prev}\n\n"
+                        if safe_prev.strip()
+                        else ""
+                    )
                     prompt = (
                         f"TASK: Draft a ready-to-send Sapaad Support email reply.\n"
                         f"LANGUAGE: {lang_rule}\n\n"
-                        f"CUSTOMER EMAIL:\n{customer_email}\n\n"
+                        f"CUSTOMER EMAIL:\n{safe_email}\n\n"
+                        f"{prev_section}"
                         f"AGENT INSTRUCTIONS (follow strictly if provided, without exposing harsh internal phrasing):\n"
-                        f"{agent_notes or 'None'}\n\n"
+                        f"{safe_notes or 'None'}\n\n"
                         f"REFERENCE CONTEXT (Sapaad Policies, KB & Past Tickets):\n"
                         f"{context_block or 'No matching context found.'}"
                     )
@@ -748,24 +839,24 @@ with col2:
                     prompt = (
                         f"TASK: Refine and polish the agent's rough draft below.\n"
                         f"LANGUAGE: {lang_rule}\n\n"
-                        f"AGENT ROUGH DRAFT:\n{agent_notes}\n\n"
-                        f"CUSTOMER EMAIL (Optional context):\n{customer_email or 'Not provided'}\n\n"
+                        f"AGENT ROUGH DRAFT:\n{safe_notes}\n\n"
+                        f"CUSTOMER EMAIL (Optional context):\n{safe_email or 'Not provided'}\n\n"
                         f"REFERENCE CONTEXT:\n{context_block or 'None'}"
                     )
                 elif mode == "FAQ / Template":
                     prompt = (
                         f"TASK: Create a concise, reusable Sapaad Support email template with clean placeholders like [Customer Name].\n"
                         f"LANGUAGE: {lang_rule}\n\n"
-                        f"TOPIC:\n{customer_email}\n"
-                        f"EXTRA NOTES:\n{agent_notes or 'None'}\n\n"
+                        f"TOPIC:\n{safe_email}\n"
+                        f"EXTRA NOTES:\n{safe_notes or 'None'}\n\n"
                         f"REFERENCE CONTEXT:\n{context_block or 'None'}"
                     )
                 else:
                     prompt = (
                         f"TASK: Write a concise English internal Groove note summarizing this ticket for teammates (translate if needed). "
                         f"Do NOT include a customer greeting or customer closing line.\n\n"
-                        f"TICKET CONTENT:\n{customer_email}\n"
-                        f"FOCUS:\n{agent_notes or 'Key issue, account details, and next action needed.'}"
+                        f"TICKET CONTENT:\n{safe_email}\n"
+                        f"FOCUS:\n{safe_notes or 'Key issue, account details, and next action needed.'}"
                     )
 
                 try:
@@ -777,23 +868,29 @@ with col2:
                         temperature=temp,
                         max_tokens=3000,
                     )
-                    agent_note, clean_draft = split_agent_note_and_clean(
-                        raw_output, mode, language, customer_email
-                    )
+                    agent_note, clean_draft = split_agent_note_and_clean(raw_output, mode, language)
                     audit_report = verify_and_repair_draft(
                         draft_text=clean_draft,
                         context_block=context_block,
                         mode=mode,
                         language_choice=language,
-                        customer_email=customer_email,
-                        agent_notes=agent_notes,
+                        customer_email=safe_email,
+                        agent_notes=safe_notes,
                     )
-                    st.session_state.last_output = audit_report["draft"]
-                    st.session_state.last_agent_note = agent_note
+                    # Restore real customer PII locally in the final output
+                    final_draft = restore_pii(audit_report["draft"], pii_map)
+                    final_agent_note = restore_pii(agent_note, pii_map)
+
+                    st.session_state.last_output = final_draft
+                    st.session_state.last_agent_note = final_agent_note
                     st.session_state.last_audit = audit_report
+                    st.session_state.last_pii_count = len(pii_map)
                     st.session_state.last_model = used_model
                     st.session_state.last_matches = matches
                     st.session_state.last_search_meta = search_meta
+                    st.session_state.last_context_block = context_block
+                    st.session_state.last_customer_email = customer_email
+                    st.session_state.last_agent_notes = agent_notes
                 except Exception as e:
                     st.error(f"API Error: {e}")
 
@@ -808,12 +905,32 @@ with col2:
             for err in audit["errors"]:
                 st.error(f"🚨 **Audit Alert:** {err}")
         elif audit:
-            st.success("✅ **Audit Passed:** Menu paths verified • Zero leaks • Groove format valid")
+            pii_count = st.session_state.get("last_pii_count", 0)
+            pii_tag = f" • 🔒 {pii_count} PII item(s) masked" if pii_count else ""
+            st.success(f"✅ **Audit Passed:** Menu paths verified • Zero leaks • Groove format valid{pii_tag}")
 
         if audit.get("auto_fixes"):
             st.caption("🛠️ **Auto-repaired:** " + " • ".join(audit["auto_fixes"]))
 
         render_groove_preview_and_copy(st.session_state.last_output)
+
+        # One-Click Post-Draft Action Pills
+        p1, p2, p3, p4, p5 = st.columns(5)
+        if p1.button("✂️ Shorten", use_container_width=True):
+            apply_quick_action("shorten", primary_provider, primary_model)
+            st.rerun()
+        if p2.button("🤝 De-escalate", use_container_width=True):
+            apply_quick_action("deescalate", primary_provider, primary_model)
+            st.rerun()
+        if p3.button("🖥️ + AnyDesk", use_container_width=True):
+            apply_quick_action("anydesk", primary_provider, primary_model)
+            st.rerun()
+        if p4.button("🌐 EN ↔ AR", use_container_width=True):
+            apply_quick_action("translate", primary_provider, primary_model)
+            st.rerun()
+        if p5.button("📝 Internal Note", use_container_width=True):
+            apply_quick_action("internal_note", primary_provider, primary_model)
+            st.rerun()
 
         meta = st.session_state.get("last_search_meta", {})
         engine_caption = f" | Search: `{meta.get('engine')}` | Grounding: `{meta.get('confidence')}`" if meta else ""
