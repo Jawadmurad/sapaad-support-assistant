@@ -66,6 +66,7 @@ def get_secret(name: str, default: str = "") -> str:
 
 GROQ_API_KEY = get_secret("GROQ_API_KEY")
 GEMINI_API_KEY = get_secret("GEMINI_API_KEY")
+OPENROUTER_API_KEY = get_secret("OPENROUTER_API_KEY")
 HF_TOKEN = get_secret("HF_TOKEN")
 HF_DATASET_REPO = get_secret("HF_DATASET_REPO")
 TEAM_PASSWORD = get_secret("TEAM_PASSWORD")
@@ -100,13 +101,16 @@ def build_budgeted_context(matches: list[dict], customer_email: str, agent_notes
 
 
 MODELS = {
-    "Groq: GPT-OSS 120B (Best Quality)": ("groq", "openai/gpt-oss-120b"),
-    "Groq: Qwen 3.8 27B (Strong Arabic/EN)": ("groq", "qwen/qwen3.8-27b"),
+    "Auto (Smart Route: EN→120B, AR→Qwen)": ("auto", "smart-route"),
+    "Groq: GPT-OSS 120B (Best English)": ("groq", "openai/gpt-oss-120b"),
+    "Groq: Qwen 3.8 27B (Best Arabic/EN)": ("groq", "qwen/qwen3.8-27b"),
     "Groq: GPT-OSS 20B (Ultra-Fast)": ("groq", "openai/gpt-oss-20b"),
     "Gemini: 2.5 Flash (High Quality)": ("gemini", "gemini-2.5-flash"),
     "Gemini: 2.5 Flash-Lite (Fast Fallback)": ("gemini", "gemini-2.5-flash-lite"),
+    "OpenRouter: Free Auto-Router": ("openrouter", "openrouter/free"),
 }
 
+# Keep SYSTEM_PROMPT 100% static so Groq prefix caching reuses cached prompt tokens automatically
 SYSTEM_PROMPT = """You are a Sapaad Customer Support email assistant. Your job is to draft customer replies, refine rough drafts, and write internal Groove ticket notes using the provided Sapaad Knowledge Base (KB) and historical Groove Support Tickets as your primary references.
 
 1. SOURCE PRIORITY & ACCURACY
@@ -164,7 +168,23 @@ def load_index():
     return _build_retrieval_index(LOCAL_DATA_DIR, HF_DATASET_REPO, HF_TOKEN)
 
 
-# ================= MULTI-PROVIDER LLM LAYER (GROQ -> GEMINI) =================
+# ================= MULTI-PROVIDER LLM LAYER (GROQ -> GEMINI -> OPENROUTER) =================
+def resolve_primary_model(selected_pair: tuple[str, str], text_hint: str, language: str) -> tuple[str, str]:
+    """Smart Language Routing: splits EN and AR load across separate Groq model buckets when Auto is selected."""
+    prov, mod = selected_pair
+    if prov != "auto":
+        return prov, mod
+
+    is_arabic = language == "Arabic" or (
+        language == "Auto (Match Customer)" and bool(re.search(r"[\u0600-\u06FF]", text_hint))
+    )
+    if GROQ_API_KEY:
+        return ("groq", "qwen/qwen3.8-27b") if is_arabic else ("groq", "openai/gpt-oss-120b")
+    if GEMINI_API_KEY:
+        return ("gemini", "gemini-2.5-flash")
+    return ("openrouter", "openrouter/free")
+
+
 def _call_groq_raw(model_id: str, system_prompt: str, user_prompt: str, temperature: float, max_tokens: int) -> str:
     client = Groq(api_key=GROQ_API_KEY)
     messages = []
@@ -218,13 +238,56 @@ def _call_gemini_raw(model_id: str, system_prompt: str, user_prompt: str, temper
     return text
 
 
+def _call_openrouter_raw(model_id: str, system_prompt: str, user_prompt: str, temperature: float, max_tokens: int) -> str:
+    url = "https://openrouter.ai/api/v1/chat/completions"
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": user_prompt})
+
+    payload = {
+        "model": model_id,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://sapaad-support-assistant.streamlit.app",
+            "X-Title": "Sapaad Support AI Assistant",
+            "User-Agent": "SapaadSupportAI/1.0",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=50) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8", errors="ignore")[:300]
+        raise RuntimeError(f"OpenRouter HTTP {e.code}: {err_body}") from e
+
+    choices = data.get("choices") or []
+    if not choices:
+        raise RuntimeError(f"OpenRouter returned no choices: {data}")
+    text = ((choices[0].get("message") or {}).get("content") or "").strip()
+    if not text:
+        raise RuntimeError("OpenRouter returned empty text.")
+    return text
+
+
 def build_fallback_chain(primary_provider: str, primary_model: str) -> list[tuple[str, str]]:
     candidates = [
         (primary_provider, primary_model),
-        ("groq", "openai/gpt-oss-20b"),
+        ("groq", "openai/gpt-oss-120b"),
         ("groq", "qwen/qwen3.8-27b"),
+        ("groq", "openai/gpt-oss-20b"),
         ("gemini", "gemini-2.5-flash"),
         ("gemini", "gemini-2.5-flash-lite"),
+        ("openrouter", "openrouter/free"),
     ]
     chain = []
     seen = set()
@@ -234,6 +297,8 @@ def build_fallback_chain(primary_provider: str, primary_model: str) -> list[tupl
         if prov == "groq" and not GROQ_API_KEY:
             continue
         if prov == "gemini" and not GEMINI_API_KEY:
+            continue
+        if prov == "openrouter" and not OPENROUTER_API_KEY:
             continue
         seen.add((prov, mod))
         chain.append((prov, mod))
@@ -250,15 +315,19 @@ def call_llm(
 ) -> tuple[str, str]:
     chain = build_fallback_chain(primary_provider, primary_model)
     if not chain:
-        raise RuntimeError("No API keys configured. Add GROQ_API_KEY and/or GEMINI_API_KEY in Secrets.")
+        raise RuntimeError(
+            "No API keys configured. Add GROQ_API_KEY, GEMINI_API_KEY, or OPENROUTER_API_KEY in Secrets."
+        )
 
     errors = []
     for idx, (prov, mod) in enumerate(chain):
         try:
             if prov == "groq":
                 out = _call_groq_raw(mod, system_prompt, user_prompt, temperature, max_tokens)
-            else:
+            elif prov == "gemini":
                 out = _call_gemini_raw(mod, system_prompt, user_prompt, temperature, max_tokens)
+            else:
+                out = _call_openrouter_raw(mod, system_prompt, user_prompt, temperature, max_tokens)
             if not out:
                 raise RuntimeError("Model returned empty output.")
             label = f"{prov}:{mod}" if idx == 0 else f"{prov}:{mod} (auto-fallback)"
@@ -279,11 +348,23 @@ def extract_english_subqueries(
     """Translate and split Arabic or multi-point emails into focused English Sapaad search queries."""
     if draft_provider == "groq":
         if draft_model == "openai/gpt-oss-20b":
-            q_candidates = [("groq", "qwen/qwen3.8-27b"), ("gemini", "gemini-2.5-flash-lite"), ("gemini", "gemini-2.5-flash")]
+            q_candidates = [
+                ("groq", "qwen/qwen3.8-27b"),
+                ("gemini", "gemini-2.5-flash-lite"),
+                ("openrouter", "openrouter/free"),
+            ]
         else:
-            q_candidates = [("groq", "openai/gpt-oss-20b"), ("gemini", "gemini-2.5-flash-lite"), ("gemini", "gemini-2.5-flash")]
+            q_candidates = [
+                ("groq", "openai/gpt-oss-20b"),
+                ("gemini", "gemini-2.5-flash-lite"),
+                ("openrouter", "openrouter/free"),
+            ]
     else:
-        q_candidates = [("gemini", "gemini-2.5-flash-lite"), ("groq", "openai/gpt-oss-20b"), ("gemini", "gemini-2.5-flash")]
+        q_candidates = [
+            ("gemini", "gemini-2.5-flash-lite"),
+            ("groq", "openai/gpt-oss-20b"),
+            ("openrouter", "openrouter/free"),
+        ]
 
     prompt = (
         "You are a search query generator for Sapaad POS support documentation.\n"
@@ -308,11 +389,15 @@ def extract_english_subqueries(
             continue
         if prov == "gemini" and not GEMINI_API_KEY:
             continue
+        if prov == "openrouter" and not OPENROUTER_API_KEY:
+            continue
         try:
             if prov == "groq":
                 raw = _call_groq_raw(mod, "", prompt, temperature=0.0, max_tokens=1600)
-            else:
+            elif prov == "gemini":
                 raw = _call_gemini_raw(mod, "", prompt, temperature=0.0, max_tokens=500)
+            else:
+                raw = _call_openrouter_raw(mod, "", prompt, temperature=0.0, max_tokens=500)
 
             lines = []
             for ln in raw.splitlines():
@@ -602,7 +687,7 @@ def render_groove_preview_and_copy(draft_text: str):
 
 
 # ================= ONE-CLICK POST-DRAFT ACTION HELPER =================
-def apply_quick_action(action_key: str, primary_provider: str, primary_model: str):
+def apply_quick_action(action_key: str, selected_pair: tuple[str, str]):
     """Transform the current draft in 1 click without re-running retrieval."""
     current_draft = st.session_state.get("last_output", "")
     if not current_draft:
@@ -648,6 +733,7 @@ def apply_quick_action(action_key: str, primary_provider: str, primary_model: st
             "what was explained/promised and any next action needed. Remove customer greeting and customer closing."
         )
 
+    primary_provider, primary_model = resolve_primary_model(selected_pair, current_draft, target_lang)
     scrubbed_list, pii_map = scrub_pii([current_draft])
     prompt = (
         f"TASK: {instruction}\n\n"
@@ -721,8 +807,11 @@ if TEAM_PASSWORD:
 
 
 # ================= MAIN UI =================
-if not GROQ_API_KEY and not GEMINI_API_KEY:
-    st.error("Missing `GROQ_API_KEY` or `GEMINI_API_KEY` secret. Add at least one in Streamlit Cloud Settings → Secrets.")
+if not GROQ_API_KEY and not GEMINI_API_KEY and not OPENROUTER_API_KEY:
+    st.error(
+        "Missing LLM API keys. Add at least one (`GROQ_API_KEY`, `GEMINI_API_KEY`, or `OPENROUTER_API_KEY`) "
+        "in Streamlit Cloud Settings → Secrets."
+    )
     st.stop()
 
 index_bundle = load_index()
@@ -731,7 +820,10 @@ stats = index_bundle.get("stats", {})
 available_models = {
     label: pair
     for label, pair in MODELS.items()
-    if (pair[0] == "groq" and GROQ_API_KEY) or (pair[0] == "gemini" and GEMINI_API_KEY)
+    if pair[0] == "auto"
+    or (pair[0] == "groq" and GROQ_API_KEY)
+    or (pair[0] == "gemini" and GEMINI_API_KEY)
+    or (pair[0] == "openrouter" and OPENROUTER_API_KEY)
 }
 
 with st.sidebar:
@@ -765,6 +857,8 @@ with st.sidebar:
         active_provs.append("Groq")
     if GEMINI_API_KEY:
         active_provs.append("Gemini")
+    if OPENROUTER_API_KEY:
+        active_provs.append("OpenRouter")
     st.caption(f"Active Providers (Auto-Fallback): **{' → '.join(active_provs)}**")
     st.caption("Privacy Shield: **Client-Side PII Scrubber ON**")
 
@@ -825,7 +919,7 @@ with col1:
     generate_btn = st.button("✨ Generate", type="primary", use_container_width=True)
 
 with col2:
-    primary_provider, primary_model = available_models[model_label]
+    selected_model_pair = available_models[model_label]
 
     if generate_btn:
         raw_search_source = (
@@ -836,6 +930,9 @@ with col2:
         if not raw_search_source:
             st.warning("Please enter an email or draft first.")
         else:
+            primary_provider, primary_model = resolve_primary_model(
+                selected_model_pair, raw_search_source, language
+            )
             [safe_email, safe_notes, safe_prev, safe_search], pii_map = scrub_pii(
                 [customer_email, agent_notes, previous_replies, raw_search_source]
             )
@@ -971,21 +1068,21 @@ with col2:
         st.markdown('<div class="quick-actions-label">⚡ Quick Refinements</div>', unsafe_allow_html=True)
         r1c1, r1c2, r1c3 = st.columns(3, gap="small")
         if r1c1.button("✂️ Shorten", use_container_width=True, help="Make the reply shorter and easier to scan"):
-            apply_quick_action("shorten", primary_provider, primary_model)
+            apply_quick_action("shorten", selected_model_pair)
             st.rerun()
         if r1c2.button("🤝 De-escalate", use_container_width=True, help="Add calm empathy for an upset customer"):
-            apply_quick_action("deescalate", primary_provider, primary_model)
+            apply_quick_action("deescalate", selected_model_pair)
             st.rerun()
         if r1c3.button("🖥️ + AnyDesk", use_container_width=True, help="Append a polite AnyDesk remote support request"):
-            apply_quick_action("anydesk", primary_provider, primary_model)
+            apply_quick_action("anydesk", selected_model_pair)
             st.rerun()
 
         r2c1, r2c2 = st.columns(2, gap="small")
         if r2c1.button("🌐 Switch EN ↔ AR", use_container_width=True, help="Translate draft between English and Arabic"):
-            apply_quick_action("translate", primary_provider, primary_model)
+            apply_quick_action("translate", selected_model_pair)
             st.rerun()
         if r2c2.button("📝 Convert to Internal Note", use_container_width=True, help="Summarize into an English Groove internal note"):
-            apply_quick_action("internal_note", primary_provider, primary_model)
+            apply_quick_action("internal_note", selected_model_pair)
             st.rerun()
 
         meta = st.session_state.get("last_search_meta", {})
