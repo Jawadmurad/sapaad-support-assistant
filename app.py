@@ -23,6 +23,37 @@ st.set_page_config(
     layout="wide",
 )
 
+# Subtle global UI polish (spacing, crisp buttons, zero-overflow action pills)
+st.markdown(
+    """
+    <style>
+    .block-container {
+        padding-top: 1.6rem;
+        padding-bottom: 2rem;
+    }
+    div[data-testid="stButton"] > button {
+        border-radius: 8px;
+        font-weight: 500;
+        padding: 0.42rem 0.65rem;
+        transition: all 0.15s ease;
+    }
+    div[data-testid="stButton"] > button p {
+        font-size: 0.88rem;
+        white-space: nowrap;
+    }
+    .quick-actions-label {
+        font-size: 0.8rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        opacity: 0.72;
+        margin: 0.35rem 0 0.4rem 0;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 
 def get_secret(name: str, default: str = "") -> str:
     try:
@@ -333,12 +364,21 @@ def split_agent_note_and_clean(text: str, mode: str, language_choice: str) -> tu
 
 
 def _format_inline_html(escaped_text: str) -> str:
+    """Convert **bold** and bare URLs (keeping trailing punctuation outside the link and isolating LTR)."""
     formatted = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped_text)
-    formatted = re.sub(
-        r"(https?://[^\s<]+)",
-        r'<a href="\1" target="_blank" rel="noopener noreferrer">\1</a>',
-        formatted,
-    )
+
+    def _linkify(match: re.Match) -> str:
+        url = match.group(1)
+        trailing = ""
+        while url and url[-1] in ".,;:!?)":
+            trailing = url[-1] + trailing
+            url = url[:-1]
+        return (
+            f'<a href="{url}" dir="ltr" style="unicode-bidi: isolate; color: #2563eb; text-decoration: underline;" '
+            f'target="_blank" rel="noopener noreferrer">{url}</a>{trailing}'
+        )
+
+    formatted = re.sub(r"(https?://[^\s<]+)", _linkify, formatted)
     return formatted
 
 
@@ -389,7 +429,7 @@ def markdown_to_groove_html(text: str) -> tuple[str, str, bool]:
     align_style = "text-align: right; " if is_rtl else ""
     groove_html = (
         f'<div{dir_attr} style="font-family: Arial, Helvetica, sans-serif; '
-        f'font-size: 14px; line-height: 1.6; color: #1f2937; {align_style}">'
+        f'font-size: 14px; line-height: 1.65; color: #1f2937; {align_style}">'
         + "".join(html_parts)
         + "</div>"
     )
@@ -406,7 +446,7 @@ def render_groove_preview_and_copy(draft_text: str):
     dir_css = "rtl" if is_rtl else "ltr"
     align_css = "right" if is_rtl else "left"
     line_count = max(10, draft_text.count("\n") + len(draft_text) // 75)
-    box_height = min(560, max(260, line_count * 24 + 90))
+    box_height = min(560, max(260, line_count * 24 + 92))
 
     component_html = f"""
     <!DOCTYPE html>
@@ -434,49 +474,64 @@ def render_groove_preview_and_copy(draft_text: str):
           border: none;
           border-radius: 8px;
           padding: 9px 16px;
-          font-size: 14px;
+          font-size: 13.5px;
           font-weight: 600;
           cursor: pointer;
-          transition: background 0.15s ease;
+          transition: background 0.15s ease, transform 0.1s ease;
         }}
         .btn-primary:hover {{ background: #e03e3e; }}
+        .btn-primary:active {{ transform: scale(0.98); }}
         .btn-secondary {{
           background: #f3f4f6;
           color: #1f2937;
           border: 1px solid #d1d5db;
           border-radius: 8px;
-          padding: 9px 14px;
+          padding: 8.5px 14px;
           font-size: 13px;
           font-weight: 500;
           cursor: pointer;
+          transition: background 0.15s ease;
         }}
         .btn-secondary:hover {{ background: #e5e7eb; }}
         .status {{
           font-size: 13px;
-          color: #059669;
+          color: #10b981;
           font-weight: 600;
         }}
         .preview-card {{
           background: #ffffff;
           color: #1f2937;
           border: 1px solid #d1d5db;
-          border-radius: 10px;
-          padding: 18px 20px;
+          border-radius: 12px;
+          padding: 20px 22px;
           direction: {dir_css};
           text-align: {align_css};
           font-family: Arial, Helvetica, sans-serif;
           font-size: 14px;
-          line-height: 1.65;
+          line-height: 1.7;
           max-height: {box_height - 65}px;
           overflow-y: auto;
-          box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+          box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+        }}
+        .preview-card::-webkit-scrollbar {{
+          width: 7px;
+        }}
+        .preview-card::-webkit-scrollbar-track {{
+          background: transparent;
+        }}
+        .preview-card::-webkit-scrollbar-thumb {{
+          background: #cbd5e1;
+          border-radius: 999px;
+        }}
+        .preview-card::-webkit-scrollbar-thumb:hover {{
+          background: #94a3b8;
         }}
         .preview-card ol, .preview-card ul {{
-          margin: 6px 0 8px 0;
+          margin: 6px 0 10px 0;
           padding-inline-start: 24px;
         }}
         .preview-card li {{
-          margin-bottom: 5px;
+          margin-bottom: 6px;
         }}
         .preview-card strong {{
           color: #111827;
@@ -715,7 +770,7 @@ with st.sidebar:
 
 st.header(f"📩 {mode}")
 
-col1, col2 = st.columns([1, 1], gap="large")
+col1, col2 = st.columns([0.95, 1.05], gap="large")
 
 with col1:
     verify_kb_in_refine = False
@@ -781,7 +836,6 @@ with col2:
         if not raw_search_source:
             st.warning("Please enter an email or draft first.")
         else:
-            # Scrub customer emails/phones locally BEFORE any external API call (Cloudflare, Groq, Gemini)
             [safe_email, safe_notes, safe_prev, safe_search], pii_map = scrub_pii(
                 [customer_email, agent_notes, previous_replies, raw_search_source]
             )
@@ -877,7 +931,6 @@ with col2:
                         customer_email=safe_email,
                         agent_notes=safe_notes,
                     )
-                    # Restore real customer PII locally in the final output
                     final_draft = restore_pii(audit_report["draft"], pii_map)
                     final_agent_note = restore_pii(agent_note, pii_map)
 
@@ -914,21 +967,24 @@ with col2:
 
         render_groove_preview_and_copy(st.session_state.last_output)
 
-        # One-Click Post-Draft Action Pills
-        p1, p2, p3, p4, p5 = st.columns(5)
-        if p1.button("✂️ Shorten", use_container_width=True):
+        # Balanced 2-row Quick Refinements bar (prevents label truncation)
+        st.markdown('<div class="quick-actions-label">⚡ Quick Refinements</div>', unsafe_allow_html=True)
+        r1c1, r1c2, r1c3 = st.columns(3, gap="small")
+        if r1c1.button("✂️ Shorten", use_container_width=True, help="Make the reply shorter and easier to scan"):
             apply_quick_action("shorten", primary_provider, primary_model)
             st.rerun()
-        if p2.button("🤝 De-escalate", use_container_width=True):
+        if r1c2.button("🤝 De-escalate", use_container_width=True, help="Add calm empathy for an upset customer"):
             apply_quick_action("deescalate", primary_provider, primary_model)
             st.rerun()
-        if p3.button("🖥️ + AnyDesk", use_container_width=True):
+        if r1c3.button("🖥️ + AnyDesk", use_container_width=True, help="Append a polite AnyDesk remote support request"):
             apply_quick_action("anydesk", primary_provider, primary_model)
             st.rerun()
-        if p4.button("🌐 EN ↔ AR", use_container_width=True):
+
+        r2c1, r2c2 = st.columns(2, gap="small")
+        if r2c1.button("🌐 Switch EN ↔ AR", use_container_width=True, help="Translate draft between English and Arabic"):
             apply_quick_action("translate", primary_provider, primary_model)
             st.rerun()
-        if p5.button("📝 Internal Note", use_container_width=True):
+        if r2c2.button("📝 Convert to Internal Note", use_container_width=True, help="Summarize into an English Groove internal note"):
             apply_quick_action("internal_note", primary_provider, primary_model)
             st.rerun()
 
