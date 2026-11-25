@@ -13,6 +13,7 @@ from retrieval import (
     build_search_index as _build_retrieval_index,
     retrieve_context as _smart_retrieve_context,
 )
+from verifier import verify_and_repair_draft
 
 # ================= CONFIGURATION =================
 st.set_page_config(
@@ -219,7 +220,6 @@ def extract_english_subqueries(
     draft_model: str,
 ) -> tuple[list[str], str]:
     """Translate and split Arabic or multi-point emails into focused English Sapaad search queries."""
-    # Pick a fast model separate from the drafting model to avoid Groq 8k TPM collisions
     if draft_provider == "groq":
         if draft_model == "openai/gpt-oss-20b":
             q_candidates = [("groq", "qwen/qwen3.8-27b"), ("gemini", "gemini-2.5-flash-lite"), ("gemini", "gemini-2.5-flash")]
@@ -260,7 +260,6 @@ def extract_english_subqueries(
             lines = []
             for ln in raw.splitlines():
                 cleaned = re.sub(r"^[\d\.\-\•\*\s]+", "", ln).strip()
-                # Filter out non-English lines or truncated 1-word fragments
                 if len(cleaned.split()) >= 2 and re.search(r"[a-zA-Z]{2,}", cleaned):
                     lines.append(cleaned)
             if lines:
@@ -495,7 +494,6 @@ def render_groove_preview_and_copy(draft_text: str):
             }}
           }} catch (err) {{}}
 
-          // Reliable fallback selecting the rendered white-background container
           const range = document.createRange();
           const box = document.getElementById("previewBox");
           range.selectNodeContents(box);
@@ -579,7 +577,6 @@ if not GROQ_API_KEY and not GEMINI_API_KEY:
 index_bundle = load_index()
 stats = index_bundle.get("stats", {})
 
-# Filter model dropdown to only providers that have API keys configured
 available_models = {
     label: pair
     for label, pair in MODELS.items()
@@ -670,7 +667,11 @@ with col1:
 
 with col2:
     if generate_btn:
-        search_source = (customer_email.strip() or agent_notes.strip()) if mode != "Refine Draft" else f"{agent_notes}\n{customer_email}".strip()
+        search_source = (
+            (customer_email.strip() or agent_notes.strip())
+            if mode != "Refine Draft"
+            else f"{agent_notes}\n{customer_email}".strip()
+        )
         if not search_source:
             st.warning("Please enter an email or draft first.")
         else:
@@ -695,7 +696,6 @@ with col2:
                 else:
                     matches, search_meta = [], {}
 
-                # Build strict budget-capped context block to prevent Groq 413/TPM errors
                 context_chunks = []
                 used_chars = 0
                 for m in matches:
@@ -766,8 +766,17 @@ with col2:
                     agent_note, clean_draft = split_agent_note_and_clean(
                         raw_output, mode, language, customer_email
                     )
-                    st.session_state.last_output = clean_draft
+                    audit_report = verify_and_repair_draft(
+                        draft_text=clean_draft,
+                        context_block=context_block,
+                        mode=mode,
+                        language_choice=language,
+                        customer_email=customer_email,
+                        agent_notes=agent_notes,
+                    )
+                    st.session_state.last_output = audit_report["draft"]
                     st.session_state.last_agent_note = agent_note
+                    st.session_state.last_audit = audit_report
                     st.session_state.last_model = used_model
                     st.session_state.last_matches = matches
                     st.session_state.last_search_meta = search_meta
@@ -779,6 +788,16 @@ with col2:
 
         if st.session_state.get("last_agent_note"):
             st.warning(f"**Internal Agent Note (not copied into email):** {st.session_state.last_agent_note}")
+
+        audit = st.session_state.get("last_audit", {})
+        if audit.get("errors"):
+            for err in audit["errors"]:
+                st.error(f"🚨 **Audit Alert:** {err}")
+        elif audit:
+            st.success("✅ **Audit Passed:** Menu paths verified • Zero leaks • Groove format valid")
+
+        if audit.get("auto_fixes"):
+            st.caption("🛠️ **Auto-repaired:** " + " • ".join(audit["auto_fixes"]))
 
         render_groove_preview_and_copy(st.session_state.last_output)
 
@@ -794,11 +813,10 @@ with col2:
                         f"**Engine:** {meta.get('engine')} | "
                         f"**Grounding Confidence:** {meta.get('confidence')} "
                         f"(BM25: {meta.get('top_bm25', 0)}, Cosine: {meta.get('top_cosine', 0)})\n\n"
-                        f"**Queries:** {' | '.join(meta.get('queries', []))}"
+                        f"**Queries:** {' | '.join(meta.get('queries', []))}{cf_err_note}"
                     )
                 for m in st.session_state.last_matches:
                     matched_tag = f" — *matched: {m['matched_query']}*" if m.get("matched_query") else ""
                     st.markdown(f"**[{m['type']}] {m['title']}** *({m['source']})*{matched_tag}")
                     st.caption(m["text"][:450] + ("..." if len(m["text"]) > 450 else ""))
                     st.divider()
-
