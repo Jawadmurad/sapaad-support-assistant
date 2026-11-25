@@ -9,6 +9,8 @@ import streamlit as st
 import streamlit.components.v1 as components
 from groq import Groq
 
+from attachments import analyze_uploaded_files
+from groove_client import fetch_groove_ticket
 from privacy import restore_pii, scrub_pii
 from retrieval import (
     build_search_index as _build_retrieval_index,
@@ -23,12 +25,11 @@ st.set_page_config(
     layout="wide",
 )
 
-# Subtle global UI polish (spacing, crisp buttons, zero-overflow action pills)
 st.markdown(
     """
     <style>
     .block-container {
-        padding-top: 1.6rem;
+        padding-top: 1.5rem;
         padding-bottom: 2rem;
     }
     div[data-testid="stButton"] > button {
@@ -72,6 +73,8 @@ HF_DATASET_REPO = get_secret("HF_DATASET_REPO")
 TEAM_PASSWORD = get_secret("TEAM_PASSWORD")
 CF_ACCOUNT_ID = get_secret("CF_ACCOUNT_ID")
 CF_API_TOKEN = get_secret("CF_API_TOKEN")
+GROOVE_API_TOKEN = get_secret("GROOVE_API_TOKEN")
+GROOVE_BEARER_TOKEN = get_secret("GROOVE_BEARER_TOKEN")
 LOCAL_DATA_DIR = "data"
 
 MAX_CONTEXT_CHARS = 10800
@@ -110,7 +113,6 @@ MODELS = {
     "OpenRouter: Free Auto-Router": ("openrouter", "openrouter/free"),
 }
 
-# Keep SYSTEM_PROMPT 100% static so Groq prefix caching reuses cached prompt tokens automatically
 SYSTEM_PROMPT = """You are a Sapaad Customer Support email assistant. Your job is to draft customer replies, refine rough drafts, and write internal Groove ticket notes using the provided Sapaad Knowledge Base (KB) and historical Groove Support Tickets as your primary references.
 
 1. SOURCE PRIORITY & ACCURACY
@@ -121,6 +123,7 @@ SYSTEM_PROMPT = """You are a Sapaad Customer Support email assistant. Your job i
 - NEVER invent or guess Sapaad menu paths, settings, or button names—not even for prerequisite steps (such as adding a surcharge). ONLY include a `>` menu path if that exact path appears in the REFERENCE CONTEXT below.
 - Always keep Sapaad UI menu paths in their original English (e.g., **Setup > Location Setup > Self Ordering Systems > Sapaad Direct**) even when replying in Arabic, because the Sapaad interface is in English. Never mix Arabic and English characters inside the same word (e.g., never write "Sapaاد").
 - If PREVIOUS REPLIES / ALREADY TRIED steps are provided, NEVER ask the customer to repeat troubleshooting steps they have already completed—acknowledge them and move straight to the next step or remote assistance.
+- If ATTACHED CUSTOMER FILES analysis is provided (screenshots, PDFs, Excel, or CSV inspection), reference the exact findings (such as specific error messages, `.xlsx` vs `.csv` format issues, non-UTF-8 encoding, blank mandatory columns, or disallowed special characters) accurately in your reply.
 - Obey AGENT INSTRUCTIONS strictly regarding how to handle the customer (e.g., whether to promise a callback/account check or guide them step-by-step), while keeping the tone warm and polite—never leak harsh internal phrasing to the customer. However, factual accuracy ALWAYS overrides self-serve instructions: if a detail is not in the REFERENCE CONTEXT, do NOT fabricate steps.
 - If the context does not clearly confirm an answer or requires account-level checking, add a short `[Agent Note: ...]` line at the very top BEFORE the greeting explaining what the agent should verify internally, and keep the email body polite and accurate.
 
@@ -161,6 +164,29 @@ RULES:
 - Use clean **bold** for key paths/dates/actions and clean numbered or bulleted lists where helpful. Never use ### headers, backticks, or tables.
 """
 
+TRANSLATE_AR_SYSTEM_PROMPT = """You are an elite English-to-Arabic SaaS & Restaurant POS localization specialist translating Sapaad Customer Support emails into flawless Modern Standard Business Arabic.
+
+STRICT QUALITY RULES:
+1. ZERO MISTAKES: Deliver natural, fluent, executive-grade Arabic with flawless grammar, spelling, punctuation, and sentence flow—never produce stiff or literal word-for-word translations.
+2. RESPECTFUL PLURAL ADDRESSING: Always address the customer in the respectful Arabic plural throughout (e.g., يُرجى منكم، قوموا، اختاروا، اضغطوا، افتحوا، احفظوا، تواصلوا). NEVER mix singular (قم، اختر) and plural, and never write typos like "واختروا" or "قموا".
+3. KEEP SAPAAD TERMS & UI PATHS IN ENGLISH: Keep all Sapaad product names, UI navigation paths, button labels, URLs, codes, and placeholders in their exact original English (e.g., **Sapaad Direct**, **Sapaad.Online**, **Cloud Print Agent**, **AnyDesk**, **Setup > Location Setup > Delivery Settings**). Never mix Arabic and English letters inside the same word.
+4. 100% FIDELITY: Preserve every single fact, step, date, time, amount, URL, and `[CUST_EMAIL_1]` / `[CUST_PHONE_1]` token accurately. Never omit details and never add unstated promises.
+5. GROOVE FORMATTING: Use **bold** cleanly for Sapaad menu paths, button names, and key headings, clean numbered lists (1., 2., 3.) or hyphen bullets (- ), and single blank lines between paragraphs. Never use ### headers, backticks, or tables. Never add a sign-off ("مع أطيب التحيات" or agent name).
+6. Output ONLY the final Arabic translation—zero commentary or explanations.
+"""
+
+PROOFREAD_AR_SYSTEM_PROMPT = """You are a senior Arabic linguist and Sapaad Support QA editor performing a final zero-mistake proofread of an Arabic email translation against its English source.
+
+Check and silently fix:
+- Any grammar, gender agreement, Hamza (أ/إ/آ), Taa Marbuta (ة/ه), or spelling mistake.
+- Any awkward literal phrasing (make it read like a native Arab support specialist wrote it).
+- Any singular/plural inconsistency (enforce respectful plural: قوموا، اختاروا، اضغطوا، تواصلوا).
+- Any accidentally translated Sapaad UI path or mixed-script word (keep Sapaad UI paths and product names in exact English).
+- Any missing fact, link, date, or number compared to the source text.
+
+Output ONLY the final perfected Arabic email text—no notes, no explanations, no Markdown headers or sign-offs.
+"""
+
 
 # ================= INDEX LOADING (DELEGATED TO retrieval.py) =================
 @st.cache_resource(show_spinner="Indexing Sapaad KB & Support Tickets (Smart BM25+)...")
@@ -170,7 +196,6 @@ def load_index():
 
 # ================= MULTI-PROVIDER LLM LAYER (GROQ -> GEMINI -> OPENROUTER) =================
 def resolve_primary_model(selected_pair: tuple[str, str], text_hint: str, language: str) -> tuple[str, str]:
-    """Smart Language Routing: splits EN and AR load across separate Groq model buckets when Auto is selected."""
     prov, mod = selected_pair
     if prov != "auto":
         return prov, mod
@@ -345,7 +370,6 @@ def extract_english_subqueries(
     draft_provider: str,
     draft_model: str,
 ) -> tuple[list[str], str]:
-    """Translate and split Arabic or multi-point emails into focused English Sapaad search queries."""
     if draft_provider == "groq":
         if draft_model == "openai/gpt-oss-20b":
             q_candidates = [
@@ -413,8 +437,7 @@ def extract_english_subqueries(
 
 
 # ================= POST-PROCESSING & GROOVE HTML CONVERTER =================
-def split_agent_note_and_clean(text: str, mode: str, language_choice: str) -> tuple[str, str]:
-    """Separate [Agent Note: ...] from the email body and apply Groove formatting safety guards."""
+def split_agent_note_and_clean(text: str, mode: str, language_choice: str, enforce_ar_greeting: bool = True) -> tuple[str, str]:
     text = text.strip()
     agent_notes = []
 
@@ -437,7 +460,7 @@ def split_agent_note_and_clean(text: str, mode: str, language_choice: str) -> tu
     text = text.replace("واختروا", "واختاروا").replace("قموا", "قوموا")
     text = text.strip()
 
-    if mode != "Internal Note / Summary":
+    if enforce_ar_greeting and mode != "Internal Note / Summary":
         is_arabic_output = (
             language_choice == "Arabic"
             or (language_choice == "Auto (Match Customer)" and bool(re.search(r"[\u0600-\u06FF]", text)))
@@ -449,7 +472,6 @@ def split_agent_note_and_clean(text: str, mode: str, language_choice: str) -> tu
 
 
 def _format_inline_html(escaped_text: str) -> str:
-    """Convert **bold** and bare URLs (keeping trailing punctuation outside the link and isolating LTR)."""
     formatted = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped_text)
 
     def _linkify(match: re.Match) -> str:
@@ -598,29 +620,13 @@ def render_groove_preview_and_copy(draft_text: str):
           overflow-y: auto;
           box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
         }}
-        .preview-card::-webkit-scrollbar {{
-          width: 7px;
-        }}
-        .preview-card::-webkit-scrollbar-track {{
-          background: transparent;
-        }}
-        .preview-card::-webkit-scrollbar-thumb {{
-          background: #cbd5e1;
-          border-radius: 999px;
-        }}
-        .preview-card::-webkit-scrollbar-thumb:hover {{
-          background: #94a3b8;
-        }}
-        .preview-card ol, .preview-card ul {{
-          margin: 6px 0 10px 0;
-          padding-inline-start: 24px;
-        }}
-        .preview-card li {{
-          margin-bottom: 6px;
-        }}
-        .preview-card strong {{
-          color: #111827;
-        }}
+        .preview-card::-webkit-scrollbar {{ width: 7px; }}
+        .preview-card::-webkit-scrollbar-track {{ background: transparent; }}
+        .preview-card::-webkit-scrollbar-thumb {{ background: #cbd5e1; border-radius: 999px; }}
+        .preview-card::-webkit-scrollbar-thumb:hover {{ background: #94a3b8; }}
+        .preview-card ol, .preview-card ul {{ margin: 6px 0 10px 0; padding-inline-start: 24px; }}
+        .preview-card li {{ margin-bottom: 6px; }}
+        .preview-card strong {{ color: #111827; }}
       </style>
     </head>
     <body>
@@ -688,7 +694,6 @@ def render_groove_preview_and_copy(draft_text: str):
 
 # ================= ONE-CLICK POST-DRAFT ACTION HELPER =================
 def apply_quick_action(action_key: str, selected_pair: tuple[str, str]):
-    """Transform the current draft in 1 click without re-running retrieval."""
     current_draft = st.session_state.get("last_output", "")
     if not current_draft:
         return
@@ -696,6 +701,7 @@ def apply_quick_action(action_key: str, selected_pair: tuple[str, str]):
     is_currently_arabic = bool(re.search(r"[\u0600-\u06FF]", current_draft))
     target_mode = "Draft Reply"
     target_lang = "Auto (Match Customer)"
+    sys_prompt = REFINE_SYSTEM_PROMPT
 
     if action_key == "shorten":
         instruction = (
@@ -721,11 +727,12 @@ def apply_quick_action(action_key: str, selected_pair: tuple[str, str]):
             )
         else:
             target_lang = "Arabic"
+            sys_prompt = TRANSLATE_AR_SYSTEM_PROMPT
             instruction = (
-                "Translate this Sapaad Support reply into polished, natural business Arabic using respectful plural "
-                "addressing (قوموا، اختاروا، اضغطوا، تواصلوا), while keeping all Sapaad UI paths in English."
+                "Translate this Sapaad Support reply into flawless, natural business Arabic using respectful plural "
+                "addressing, keeping all Sapaad UI paths in English."
             )
-    else:  # internal_note
+    else:
         target_mode = "Internal Note / Summary"
         target_lang = "English"
         instruction = (
@@ -735,18 +742,15 @@ def apply_quick_action(action_key: str, selected_pair: tuple[str, str]):
 
     primary_provider, primary_model = resolve_primary_model(selected_pair, current_draft, target_lang)
     scrubbed_list, pii_map = scrub_pii([current_draft])
-    prompt = (
-        f"TASK: {instruction}\n\n"
-        f"CURRENT DRAFT:\n{scrubbed_list[0]}"
-    )
+    prompt = f"TASK: {instruction}\n\nCURRENT DRAFT:\n{scrubbed_list[0]}"
 
     with st.spinner("Applying quick refinement..."):
         raw_out, used_model = call_llm(
             primary_provider=primary_provider,
             primary_model=primary_model,
-            system_prompt=REFINE_SYSTEM_PROMPT,
+            system_prompt=sys_prompt,
             user_prompt=prompt,
-            temperature=0.25,
+            temperature=0.22,
             max_tokens=2400,
         )
         _, cleaned = split_agent_note_and_clean(raw_out, target_mode, target_lang)
@@ -763,7 +767,21 @@ def apply_quick_action(action_key: str, selected_pair: tuple[str, str]):
         st.session_state.last_model = used_model
 
 
-# ================= PASSWORD GATE (ENTER SUBMIT + PASSWORD MANAGER + EYE ICON) =================
+# ================= BOOKMARKLET HANDSHAKE (AUTO-CONNECT GROOVE) =================
+st.session_state.setdefault("groove_runtime_bearer", "")
+st.session_state.setdefault("pending_groove_ticket", "")
+
+if "gtoken" in st.query_params or "ticket" in st.query_params:
+    incoming_tok = str(st.query_params.get("gtoken", "")).strip()
+    incoming_tkt = str(st.query_params.get("ticket", "")).strip()
+    if incoming_tok:
+        st.session_state.groove_runtime_bearer = incoming_tok
+    if incoming_tkt:
+        st.session_state.pending_groove_ticket = incoming_tkt
+    st.query_params.clear()
+
+
+# ================= PASSWORD GATE =================
 if TEAM_PASSWORD:
     if "authenticated" not in st.session_state:
         st.session_state.authenticated = False
@@ -784,12 +802,13 @@ if TEAM_PASSWORD:
         _, center_col, _ = st.columns([1, 1.3, 1])
         with center_col:
             st.title("🔒 Sapaad Support AI Assistant")
-            with st.form("login_form", clear_on_submit=False):
-                st.text_input(
-                    "Team Account",
-                    value="sapaad-support-team",
-                    autocomplete="username",
+            if st.session_state.get("pending_groove_ticket"):
+                st.info(
+                    f"🔗 Groove Ticket **#{st.session_state.pending_groove_ticket}** queued — "
+                    "log in to load it automatically."
                 )
+            with st.form("login_form", clear_on_submit=False):
+                st.text_input("Team Account", value="sapaad-support-team", autocomplete="username")
                 pwd = st.text_input(
                     "Enter Team Password",
                     type="password",
@@ -806,7 +825,12 @@ if TEAM_PASSWORD:
         st.stop()
 
 
-# ================= MAIN UI =================
+# ================= SESSION STATE INIT =================
+st.session_state.setdefault("customer_email_box", "")
+st.session_state.setdefault("prev_replies_box", "")
+st.session_state.setdefault("loaded_ticket_banner", "")
+st.session_state.setdefault("attachment_cache", {})
+
 if not GROQ_API_KEY and not GEMINI_API_KEY and not OPENROUTER_API_KEY:
     st.error(
         "Missing LLM API keys. Add at least one (`GROQ_API_KEY`, `GEMINI_API_KEY`, or `OPENROUTER_API_KEY`) "
@@ -826,18 +850,50 @@ available_models = {
     or (pair[0] == "openrouter" and OPENROUTER_API_KEY)
 }
 
+# ================= SIDEBAR =================
 with st.sidebar:
     st.title("⚙️ Sapaad Support AI")
     mode = st.radio(
         "Mode",
-        ["Draft Reply", "Refine Draft", "FAQ / Template", "Internal Note / Summary"],
+        [
+            "Draft Reply",
+            "🌍 Arabic Translator",
+            "Refine Draft",
+            "FAQ / Template",
+            "Internal Note / Summary",
+        ],
         index=0,
     )
-    language = st.selectbox("Output Language", ["Auto (Match Customer)", "English", "Arabic"])
+    language = (
+        "Arabic"
+        if mode == "🌍 Arabic Translator"
+        else st.selectbox("Output Language", ["Auto (Match Customer)", "English", "Arabic"])
+    )
     model_label = st.selectbox("AI Model", list(available_models.keys()), index=0)
-    top_k = st.slider("Reference Sources to Pull", min_value=3, max_value=8, value=5)
+    if mode in ("Draft Reply", "Refine Draft", "FAQ / Template"):
+        top_k = st.slider("Reference Sources to Pull", min_value=3, max_value=8, value=5)
+    else:
+        top_k = 5
 
     st.divider()
+    with st.expander("🔗 Groove Connection (Ticket Fetch)"):
+        if GROOVE_API_TOKEN:
+            st.success("Groove REST API Token active (permanent).")
+        elif st.session_state.groove_runtime_bearer:
+            st.success("Connected via Groove 1-Click Bookmarklet.")
+        elif GROOVE_BEARER_TOKEN:
+            st.success("Groove GraphQL Bearer Token active.")
+        else:
+            st.info("Click your **✨ Sapaad AI** bookmark while on Groove to connect automatically.")
+        runtime_tok = st.text_input(
+            "Manual Session Bearer Token (Optional)",
+            value=st.session_state.groove_runtime_bearer,
+            type="password",
+            placeholder="Auto-filled by bookmarklet...",
+            help="Filled automatically by the Groove bookmarklet, or paste manually if needed.",
+        )
+        st.session_state.groove_runtime_bearer = runtime_tok
+
     if index_bundle.get("docs"):
         policy_note = f" + **{stats.get('policies', 0)}** policies" if stats.get("policies") else ""
         st.success(
@@ -859,33 +915,150 @@ with st.sidebar:
         active_provs.append("Gemini")
     if OPENROUTER_API_KEY:
         active_provs.append("OpenRouter")
-    st.caption(f"Active Providers (Auto-Fallback): **{' → '.join(active_provs)}**")
+    st.caption(f"Active Providers: **{' → '.join(active_provs)}**")
     st.caption("Privacy Shield: **Client-Side PII Scrubber ON**")
 
-st.header(f"📩 {mode}")
+header_icon = "" if mode.startswith("🌍") else "📩 "
+st.header(f"{header_icon}{mode}")
 
 col1, col2 = st.columns([0.95, 1.05], gap="large")
 
 with col1:
     verify_kb_in_refine = False
+    uploaded_files = []
+    proofread_ar = True
+    include_groove_envelope = True
     previous_replies = ""
+    agent_notes = ""
+    customer_email = ""
+
+    # -------- GROOVE TICKET FETCHER BAR (Draft Reply & Internal Note) --------
+    if mode in ("Draft Reply", "Internal Note / Summary"):
+        g1, g2, g3 = st.columns([2.2, 1.1, 0.7], gap="small")
+        ticket_num_input = g1.text_input(
+            "Groove Ticket #",
+            placeholder="Enter Groove Ticket # (e.g., 114201)",
+            label_visibility="collapsed",
+        )
+        fetch_clicked = g2.button("📥 Fetch Ticket", use_container_width=True)
+        clear_clicked = g3.button("🧹 Clear", use_container_width=True, help="Clear loaded ticket fields")
+
+        if clear_clicked:
+            st.session_state.customer_email_box = ""
+            st.session_state.prev_replies_box = ""
+            st.session_state.loaded_ticket_banner = ""
+            st.rerun()
+
+        if fetch_clicked:
+            active_bearer = st.session_state.groove_runtime_bearer.strip() or GROOVE_BEARER_TOKEN
+            with st.spinner(f"Fetching Ticket #{ticket_num_input} from Groove..."):
+                try:
+                    t_data = fetch_groove_ticket(
+                        ticket_input=ticket_num_input,
+                        groove_api_token=GROOVE_API_TOKEN,
+                        groove_bearer_token=active_bearer,
+                    )
+                    if mode == "Internal Note / Summary":
+                        st.session_state.customer_email_box = t_data["full_thread"]
+                        st.session_state.prev_replies_box = ""
+                    else:
+                        st.session_state.customer_email_box = t_data["latest_customer_email"]
+                        st.session_state.prev_replies_box = t_data["previous_thread"]
+
+                    subj_tag = f" — *{t_data['subject']}*" if t_data.get("subject") else ""
+                    st.session_state.loaded_ticket_banner = (
+                        f"Loaded **Ticket #{t_data['ticket_number']}**{subj_tag} "
+                        f"({t_data['message_count']} message(s) pulled from Groove)"
+                    )
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Groove Fetch Error: {e}")
+
+        # Auto-fetch ticket if opened via the Groove 1-Click Bookmarklet
+        if st.session_state.get("pending_groove_ticket"):
+            auto_tkt = st.session_state.pop("pending_groove_ticket")
+            active_bearer = st.session_state.groove_runtime_bearer.strip() or GROOVE_BEARER_TOKEN
+            with st.spinner(f"Auto-loading Ticket #{auto_tkt} from Groove..."):
+                try:
+                    t_data = fetch_groove_ticket(
+                        ticket_input=auto_tkt,
+                        groove_api_token=GROOVE_API_TOKEN,
+                        groove_bearer_token=active_bearer,
+                    )
+                    if mode == "Internal Note / Summary":
+                        st.session_state.customer_email_box = t_data["full_thread"]
+                        st.session_state.prev_replies_box = ""
+                    else:
+                        st.session_state.customer_email_box = t_data["latest_customer_email"]
+                        st.session_state.prev_replies_box = t_data["previous_thread"]
+
+                    subj_tag = f" — *{t_data['subject']}*" if t_data.get("subject") else ""
+                    st.session_state.loaded_ticket_banner = (
+                        f"Auto-loaded **Ticket #{t_data['ticket_number']}**{subj_tag} "
+                        f"({t_data['message_count']} message(s) pulled from Groove)"
+                    )
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Groove Auto-Fetch Error: {e}")
+
+        if st.session_state.loaded_ticket_banner:
+            st.info(st.session_state.loaded_ticket_banner)
+
+    # -------- MODE-SPECIFIC INPUTS --------
     if mode == "Draft Reply":
         customer_email = st.text_area(
-            "Paste Customer Email",
-            height=230,
-            placeholder="Paste the full customer email from Groove here...",
+            "Paste Customer Email (or fetch by Ticket # above)",
+            key="customer_email_box",
+            height=210,
+            placeholder="Paste the full customer email from Groove here, or enter a Ticket # above...",
         )
-        with st.expander("💬 Previous Replies / Already Tried (Optional)"):
+        uploaded_files = st.file_uploader(
+            "📎 Attach Customer Media / Files (Optional: Photo, PDF, Excel, CSV)",
+            type=["png", "jpg", "jpeg", "webp", "pdf", "xlsx", "xls", "csv"],
+            accept_multiple_files=True,
+            help="Screenshots are read via Gemini Vision; Excel/CSV files are inspected locally for Sapaad upload errors.",
+        )
+        with st.expander(
+            "💬 Previous Replies / Already Tried (Optional)",
+            expanded=bool(st.session_state.prev_replies_box.strip()),
+        ):
             previous_replies = st.text_area(
-                "Paste earlier thread replies or steps customer already tried",
-                height=110,
-                placeholder="e.g., Customer already cleared browser cache, restarted router, and reinstalled CPA...",
+                "Earlier thread messages or troubleshooting steps already tried",
+                key="prev_replies_box",
+                height=115,
+                placeholder="Auto-filled when fetching a Groove ticket, or paste earlier replies here...",
             )
         agent_notes = st.text_area(
             "Agent Instructions / Key Points (Optional)",
-            height=100,
+            height=95,
             placeholder="e.g., Ask if they are using Android or iOS / Tell them we tried calling and need AnyDesk ID...",
         )
+        btn_label = "✨ Generate Reply"
+
+    elif mode == "🌍 Arabic Translator":
+        customer_email = st.text_area(
+            "Write or Paste Email to Translate to Arabic",
+            height=260,
+            placeholder="Paste an English email (or rough draft) here to translate into flawless Sapaad Arabic in one click...",
+        )
+        t_opt1, t_opt2 = st.columns(2)
+        proofread_ar = t_opt1.checkbox(
+            "✨ 0-Mistake Proofread Pass",
+            value=True,
+            help="Runs a 2nd Arabic linguistic QA pass to eliminate grammar, plural, or phrasing slips.",
+        )
+        include_groove_envelope = t_opt2.checkbox(
+            "Include Groove Greeting & Closing",
+            value=True,
+            help="Ensures السلام عليكم، and لا تترددوا بالتواصل معنا لأي مساعدة إضافية.",
+        )
+        agent_notes = st.text_area(
+            "Optional Tone / Extra Note",
+            height=75,
+            placeholder="e.g., Keep it extra warm and apologetic / Keep the product name in English...",
+        )
+        btn_label = "🌍 Translate to Arabic"
+
     elif mode == "Refine Draft":
         agent_notes = st.text_area(
             "Your Rough Draft to Refine",
@@ -901,6 +1074,8 @@ with col1:
             "Verify technical Sapaad steps against KB & Tickets",
             value=False,
         )
+        btn_label = "✨ Refine Draft"
+
     elif mode == "FAQ / Template":
         customer_email = st.text_area(
             "Topic / Scenario for Reusable Template",
@@ -908,141 +1083,241 @@ with col1:
             placeholder="e.g., How to install Cloud Print Agent and find the API key...",
         )
         agent_notes = st.text_area("Extra Requirements (Optional)", height=100)
+        btn_label = "✨ Generate Template"
+
     else:
         customer_email = st.text_area(
-            "Paste Ticket Thread or Foreign-Language Email",
-            height=270,
-            placeholder="Paste the email or thread to summarize into an English internal note...",
+            "Paste Ticket Thread or Fetch by Ticket # Above",
+            key="customer_email_box",
+            height=250,
+            placeholder="Paste the email/thread or fetch a Groove Ticket # above to summarize into an English internal note...",
+        )
+        uploaded_files = st.file_uploader(
+            "📎 Attach Files to Include in Summary (Optional)",
+            type=["png", "jpg", "jpeg", "webp", "pdf", "xlsx", "xls", "csv"],
+            accept_multiple_files=True,
         )
         agent_notes = st.text_area("Focus / Specific Question (Optional)", height=80)
+        btn_label = "✨ Generate Internal Note"
 
-    generate_btn = st.button("✨ Generate", type="primary", use_container_width=True)
+    generate_btn = st.button(btn_label, type="primary", use_container_width=True)
 
 with col2:
     selected_model_pair = available_models[model_label]
 
     if generate_btn:
-        raw_search_source = (
-            (customer_email.strip() or agent_notes.strip())
-            if mode != "Refine Draft"
-            else f"{agent_notes}\n{customer_email}".strip()
-        )
+        attachment_summary, attachment_labels = ("", [])
+        if uploaded_files:
+            with st.spinner("Analyzing attached media / files..."):
+                attachment_summary, attachment_labels = analyze_uploaded_files(
+                    uploaded_files, GEMINI_API_KEY, st.session_state.attachment_cache
+                )
+
+        if mode == "Refine Draft":
+            raw_search_source = f"{agent_notes}\n{customer_email}".strip()
+        else:
+            raw_search_source = "\n".join(
+                p for p in [customer_email.strip(), attachment_summary.strip(), agent_notes.strip()] if p
+            ).strip()
+
         if not raw_search_source:
-            st.warning("Please enter an email or draft first.")
+            st.warning("Please enter an email, ticket number, or attach a file first.")
         else:
             primary_provider, primary_model = resolve_primary_model(
                 selected_model_pair, raw_search_source, language
             )
-            [safe_email, safe_notes, safe_prev, safe_search], pii_map = scrub_pii(
-                [customer_email, agent_notes, previous_replies, raw_search_source]
+            [safe_email, safe_notes, safe_prev, safe_attach, safe_search], pii_map = scrub_pii(
+                [customer_email, agent_notes, previous_replies, attachment_summary, raw_search_source]
             )
 
-            should_search = (
-                mode in ("Draft Reply", "FAQ / Template")
-                or (mode == "Refine Draft" and verify_kb_in_refine)
-            )
+            # -------- DEDICATED 1-CLICK ARABIC TRANSLATOR PIPELINE --------
+            if mode == "🌍 Arabic Translator":
+                if selected_model_pair[0] == "auto":
+                    if GROQ_API_KEY:
+                        primary_provider, primary_model = ("groq", "qwen/qwen3.8-27b")
+                    elif GEMINI_API_KEY:
+                        primary_provider, primary_model = ("gemini", "gemini-2.5-flash")
 
-            with st.spinner("Searching Sapaad KB & Tickets and generating..."):
-                if should_search:
-                    matches, search_meta = _smart_retrieve_context(
-                        index_bundle=index_bundle,
-                        query=safe_search,
-                        extract_subqueries_fn=lambda txt: extract_english_subqueries(
-                            txt, primary_provider, primary_model
-                        ),
-                        top_k=top_k,
-                        cf_account_id=CF_ACCOUNT_ID,
-                        cf_api_token=CF_API_TOKEN,
-                    )
-                else:
-                    matches, search_meta = [], {}
+                envelope_rule = (
+                    "Include the Sapaad Arabic greeting ('السلام عليكم،') and the exact single closing line "
+                    "('لا تترددوا بالتواصل معنا لأي مساعدة إضافية.') with NO sign-off."
+                    if include_groove_envelope
+                    else "Translate only the provided text cleanly without adding extra greetings or closings."
+                )
+                trans_prompt = (
+                    f"TASK: Translate the email/text below into flawless, natural Sapaad Business Arabic.\n"
+                    f"ENVELOPE RULE: {envelope_rule}\n"
+                    f"EXTRA NOTE: {safe_notes or 'None'}\n\n"
+                    f"SOURCE TEXT:\n{safe_email}"
+                )
+                with st.spinner("Translating to professional Arabic..."):
+                    try:
+                        ar_draft, used_model = call_llm(
+                            primary_provider=primary_provider,
+                            primary_model=primary_model,
+                            system_prompt=TRANSLATE_AR_SYSTEM_PROMPT,
+                            user_prompt=trans_prompt,
+                            temperature=0.15,
+                            max_tokens=2800,
+                        )
+                        if proofread_ar:
+                            qa_prompt = (
+                                f"SOURCE TEXT:\n{safe_email}\n\n"
+                                f"ARABIC DRAFT TO PROOFREAD:\n{ar_draft}\n\n"
+                                f"ENVELOPE RULE: {envelope_rule}"
+                            )
+                            ar_draft, qa_model = call_llm(
+                                primary_provider=primary_provider,
+                                primary_model=primary_model,
+                                system_prompt=PROOFREAD_AR_SYSTEM_PROMPT,
+                                user_prompt=qa_prompt,
+                                temperature=0.10,
+                                max_tokens=2800,
+                            )
+                            used_model = f"{used_model} + QA({qa_model})"
 
-                context_block = build_budgeted_context(matches, safe_email, safe_notes, language)
+                        verify_mode = "Draft Reply" if include_groove_envelope else "Internal Note / Summary"
+                        _, clean_draft = split_agent_note_and_clean(
+                            ar_draft, verify_mode, "Arabic", enforce_ar_greeting=include_groove_envelope
+                        )
+                        audit_report = verify_and_repair_draft(
+                            draft_text=clean_draft,
+                            context_block="",
+                            mode=verify_mode,
+                            language_choice="Arabic",
+                            customer_email=safe_email,
+                            agent_notes=safe_notes,
+                        )
+                        st.session_state.last_output = restore_pii(audit_report["draft"], pii_map)
+                        st.session_state.last_agent_note = ""
+                        st.session_state.last_audit = audit_report
+                        st.session_state.last_pii_count = len(pii_map)
+                        st.session_state.last_model = used_model
+                        st.session_state.last_matches = []
+                        st.session_state.last_search_meta = {}
+                        st.session_state.last_attachment_labels = []
+                        st.session_state.last_attachment_summary = ""
+                        st.session_state.last_context_block = ""
+                    except Exception as e:
+                        st.error(f"Translation Error: {e}")
 
-                lang_rule = (
-                    "Match the customer's language (English or Arabic)."
-                    if language == "Auto (Match Customer)"
-                    else f"Write the output in {language}."
+            # -------- STANDARD SUPPORT / RAG MODES --------
+            else:
+                should_search = (
+                    mode in ("Draft Reply", "FAQ / Template")
+                    or (mode == "Refine Draft" and verify_kb_in_refine)
                 )
 
-                active_system_prompt = SYSTEM_PROMPT
-                temp = 0.22
+                with st.spinner("Searching Sapaad KB & Tickets and generating..."):
+                    if should_search:
+                        matches, search_meta = _smart_retrieve_context(
+                            index_bundle=index_bundle,
+                            query=safe_search,
+                            extract_subqueries_fn=lambda txt: extract_english_subqueries(
+                                txt, primary_provider, primary_model
+                            ),
+                            top_k=top_k,
+                            cf_account_id=CF_ACCOUNT_ID,
+                            cf_api_token=CF_API_TOKEN,
+                        )
+                    else:
+                        matches, search_meta = [], {}
 
-                if mode == "Draft Reply":
-                    prev_section = (
-                        f"PREVIOUS REPLIES / ALREADY TRIED (do NOT repeat these steps):\n{safe_prev}\n\n"
-                        if safe_prev.strip()
+                    context_block = build_budgeted_context(matches, safe_email, safe_notes, language)
+
+                    lang_rule = (
+                        "Match the customer's language (English or Arabic)."
+                        if language == "Auto (Match Customer)"
+                        else f"Write the output in {language}."
+                    )
+
+                    active_system_prompt = SYSTEM_PROMPT
+                    temp = 0.22
+                    attach_section = (
+                        f"ATTACHED CUSTOMER FILES ANALYSIS (screenshots/PDF/Excel/CSV):\n{safe_attach}\n\n"
+                        if safe_attach.strip()
                         else ""
                     )
-                    prompt = (
-                        f"TASK: Draft a ready-to-send Sapaad Support email reply.\n"
-                        f"LANGUAGE: {lang_rule}\n\n"
-                        f"CUSTOMER EMAIL:\n{safe_email}\n\n"
-                        f"{prev_section}"
-                        f"AGENT INSTRUCTIONS (follow strictly if provided, without exposing harsh internal phrasing):\n"
-                        f"{safe_notes or 'None'}\n\n"
-                        f"REFERENCE CONTEXT (Sapaad Policies, KB & Past Tickets):\n"
-                        f"{context_block or 'No matching context found.'}"
-                    )
-                elif mode == "Refine Draft":
-                    active_system_prompt = REFINE_SYSTEM_PROMPT
-                    temp = 0.35
-                    prompt = (
-                        f"TASK: Refine and polish the agent's rough draft below.\n"
-                        f"LANGUAGE: {lang_rule}\n\n"
-                        f"AGENT ROUGH DRAFT:\n{safe_notes}\n\n"
-                        f"CUSTOMER EMAIL (Optional context):\n{safe_email or 'Not provided'}\n\n"
-                        f"REFERENCE CONTEXT:\n{context_block or 'None'}"
-                    )
-                elif mode == "FAQ / Template":
-                    prompt = (
-                        f"TASK: Create a concise, reusable Sapaad Support email template with clean placeholders like [Customer Name].\n"
-                        f"LANGUAGE: {lang_rule}\n\n"
-                        f"TOPIC:\n{safe_email}\n"
-                        f"EXTRA NOTES:\n{safe_notes or 'None'}\n\n"
-                        f"REFERENCE CONTEXT:\n{context_block or 'None'}"
-                    )
-                else:
-                    prompt = (
-                        f"TASK: Write a concise English internal Groove note summarizing this ticket for teammates (translate if needed). "
-                        f"Do NOT include a customer greeting or customer closing line.\n\n"
-                        f"TICKET CONTENT:\n{safe_email}\n"
-                        f"FOCUS:\n{safe_notes or 'Key issue, account details, and next action needed.'}"
-                    )
 
-                try:
-                    raw_output, used_model = call_llm(
-                        primary_provider=primary_provider,
-                        primary_model=primary_model,
-                        system_prompt=active_system_prompt,
-                        user_prompt=prompt,
-                        temperature=temp,
-                        max_tokens=3000,
-                    )
-                    agent_note, clean_draft = split_agent_note_and_clean(raw_output, mode, language)
-                    audit_report = verify_and_repair_draft(
-                        draft_text=clean_draft,
-                        context_block=context_block,
-                        mode=mode,
-                        language_choice=language,
-                        customer_email=safe_email,
-                        agent_notes=safe_notes,
-                    )
-                    final_draft = restore_pii(audit_report["draft"], pii_map)
-                    final_agent_note = restore_pii(agent_note, pii_map)
+                    if mode == "Draft Reply":
+                        prev_section = (
+                            f"PREVIOUS REPLIES / ALREADY TRIED (do NOT repeat these steps):\n{safe_prev}\n\n"
+                            if safe_prev.strip()
+                            else ""
+                        )
+                        prompt = (
+                            f"TASK: Draft a ready-to-send Sapaad Support email reply.\n"
+                            f"LANGUAGE: {lang_rule}\n\n"
+                            f"CUSTOMER EMAIL:\n{safe_email or 'See attached file(s) below.'}\n\n"
+                            f"{attach_section}"
+                            f"{prev_section}"
+                            f"AGENT INSTRUCTIONS (follow strictly if provided, without exposing harsh internal phrasing):\n"
+                            f"{safe_notes or 'None'}\n\n"
+                            f"REFERENCE CONTEXT (Sapaad Policies, KB & Past Tickets):\n"
+                            f"{context_block or 'No matching context found.'}"
+                        )
+                    elif mode == "Refine Draft":
+                        active_system_prompt = REFINE_SYSTEM_PROMPT
+                        temp = 0.35
+                        prompt = (
+                            f"TASK: Refine and polish the agent's rough draft below.\n"
+                            f"LANGUAGE: {lang_rule}\n\n"
+                            f"AGENT ROUGH DRAFT:\n{safe_notes}\n\n"
+                            f"CUSTOMER EMAIL (Optional context):\n{safe_email or 'Not provided'}\n\n"
+                            f"REFERENCE CONTEXT:\n{context_block or 'None'}"
+                        )
+                    elif mode == "FAQ / Template":
+                        prompt = (
+                            f"TASK: Create a concise, reusable Sapaad Support email template with clean placeholders like [Customer Name].\n"
+                            f"LANGUAGE: {lang_rule}\n\n"
+                            f"TOPIC:\n{safe_email}\n"
+                            f"EXTRA NOTES:\n{safe_notes or 'None'}\n\n"
+                            f"REFERENCE CONTEXT:\n{context_block or 'None'}"
+                        )
+                    else:
+                        prompt = (
+                            f"TASK: Write a concise English internal Groove note summarizing this ticket for teammates (translate if needed). "
+                            f"Do NOT include a customer greeting or customer closing line.\n\n"
+                            f"TICKET CONTENT:\n{safe_email}\n\n"
+                            f"{attach_section}"
+                            f"FOCUS:\n{safe_notes or 'Key issue, account details, what was tried, and next action needed.'}"
+                        )
 
-                    st.session_state.last_output = final_draft
-                    st.session_state.last_agent_note = final_agent_note
-                    st.session_state.last_audit = audit_report
-                    st.session_state.last_pii_count = len(pii_map)
-                    st.session_state.last_model = used_model
-                    st.session_state.last_matches = matches
-                    st.session_state.last_search_meta = search_meta
-                    st.session_state.last_context_block = context_block
-                    st.session_state.last_customer_email = customer_email
-                    st.session_state.last_agent_notes = agent_notes
-                except Exception as e:
-                    st.error(f"API Error: {e}")
+                    try:
+                        raw_output, used_model = call_llm(
+                            primary_provider=primary_provider,
+                            primary_model=primary_model,
+                            system_prompt=active_system_prompt,
+                            user_prompt=prompt,
+                            temperature=temp,
+                            max_tokens=3000,
+                        )
+                        agent_note, clean_draft = split_agent_note_and_clean(raw_output, mode, language)
+                        audit_report = verify_and_repair_draft(
+                            draft_text=clean_draft,
+                            context_block=context_block,
+                            mode=mode,
+                            language_choice=language,
+                            customer_email=safe_email,
+                            agent_notes=safe_notes,
+                        )
+                        final_draft = restore_pii(audit_report["draft"], pii_map)
+                        final_agent_note = restore_pii(agent_note, pii_map)
+
+                        st.session_state.last_output = final_draft
+                        st.session_state.last_agent_note = final_agent_note
+                        st.session_state.last_audit = audit_report
+                        st.session_state.last_pii_count = len(pii_map)
+                        st.session_state.last_model = used_model
+                        st.session_state.last_matches = matches
+                        st.session_state.last_search_meta = search_meta
+                        st.session_state.last_attachment_labels = attachment_labels
+                        st.session_state.last_attachment_summary = attachment_summary
+                        st.session_state.last_context_block = context_block
+                        st.session_state.last_customer_email = customer_email
+                        st.session_state.last_agent_notes = agent_notes
+                    except Exception as e:
+                        st.error(f"API Error: {e}")
 
     if "last_output" in st.session_state:
         st.subheader("Ready for Groove")
@@ -1062,9 +1337,11 @@ with col2:
         if audit.get("auto_fixes"):
             st.caption("🛠️ **Auto-repaired:** " + " • ".join(audit["auto_fixes"]))
 
+        if st.session_state.get("last_attachment_labels"):
+            st.caption("📎 **Attachments Analyzed:** " + " • ".join(st.session_state.last_attachment_labels))
+
         render_groove_preview_and_copy(st.session_state.last_output)
 
-        # Balanced 2-row Quick Refinements bar (prevents label truncation)
         st.markdown('<div class="quick-actions-label">⚡ Quick Refinements</div>', unsafe_allow_html=True)
         r1c1, r1c2, r1c3 = st.columns(3, gap="small")
         if r1c1.button("✂️ Shorten", use_container_width=True, help="Make the reply shorter and easier to scan"):
@@ -1088,6 +1365,10 @@ with col2:
         meta = st.session_state.get("last_search_meta", {})
         engine_caption = f" | Search: `{meta.get('engine')}` | Grounding: `{meta.get('confidence')}`" if meta else ""
         st.caption(f"Model used: `{st.session_state.last_model}`{engine_caption}")
+
+        if st.session_state.get("last_attachment_summary"):
+            with st.expander("📎 View Extracted Attachment Details"):
+                st.text(st.session_state.last_attachment_summary)
 
         if st.session_state.get("last_matches"):
             with st.expander(f"📚 Referenced Sources ({len(st.session_state.last_matches)})"):
