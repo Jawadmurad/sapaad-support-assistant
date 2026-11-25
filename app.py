@@ -789,6 +789,7 @@ with col2:
         if st.session_state.get("last_matches"):
             with st.expander(f"📚 Referenced Sources ({len(st.session_state.last_matches)})"):
                 if meta:
+                    cf_err_note = f"\n\n⚠️ **Cloudflare Hybrid Note:** `{meta['cf_error']}`" if meta.get("cf_error") else ""
                     st.info(
                         f"**Engine:** {meta.get('engine')} | "
                         f"**Grounding Confidence:** {meta.get('confidence')} "
@@ -800,3 +801,4 @@ with col2:
                     st.markdown(f"**[{m['type']}] {m['title']}** *({m['source']})*{matched_tag}")
                     st.caption(m["text"][:450] + ("..." if len(m["text"]) > 450 else ""))
                     st.divider()
+
