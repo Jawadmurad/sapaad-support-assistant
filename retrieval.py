@@ -320,25 +320,27 @@ def build_search_index(local_dir: str, hf_repo: str, hf_token: str) -> dict:
 
 # ================= 4. SMART BYPASS & CLOUDFLARE EMBEDDING =================
 def should_bypass_llm_query_extraction(text: str) -> bool:
-    """Skip LLM query extraction for short, single-topic English emails (saves 30-40% tokens)."""
+    """Skip LLM query extraction ONLY for short, single-topic English emails."""
     has_arabic = bool(re.search(r"[\u0600-\u06FF]", text))
     if has_arabic:
         return False
-    if len(text.strip()) > 380:
+    if len(text.strip()) > 320:
         return False
-    # Check if customer wrote a numbered/bulleted multi-question list
-    list_items = re.findall(r"(?m)^\s*(?:\d+[\.\)]|[-•\*])\s+\S+", text)
-    if len(list_items) >= 2:
+    # Catch BOTH multi-line AND inline numbered/bulleted lists (e.g., "1) ... 2) ...")
+    inline_numbers = re.findall(r"(?:^|\s)\d+[\.\)]\s+\S+", text)
+    line_bullets = re.findall(r"(?m)^\s*[-•\*]\s+\S+", text)
+    if len(inline_numbers) >= 2 or len(line_bullets) >= 2:
         return False
-    if text.count("?") >= 3:
+    # Catch multi-question or multi-clause requests
+    if text.count("?") >= 2 or text.count(",") >= 3:
         return False
     return True
 
 
-def embed_query_cloudflare(text: str, account_id: str, api_token: str) -> Optional[np.ndarray]:
-    """Embed only the incoming customer email via Cloudflare Workers AI @cf/baai/bge-m3 (free tier)."""
+def embed_query_cloudflare(text: str, account_id: str, api_token: str) -> tuple[Optional[np.ndarray], str]:
+    """Embed only the incoming customer email via Cloudflare Workers AI @cf/baai/bge-m3."""
     if not account_id or not api_token:
-        return None
+        return None, "Missing CF_ACCOUNT_ID or CF_API_TOKEN"
     url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/@cf/baai/bge-m3"
     payload = json.dumps({"text": [text[:2000]], "truncate_inputs": True}).encode("utf-8")
     req = urllib.request.Request(
@@ -347,17 +349,18 @@ def embed_query_cloudflare(text: str, account_id: str, api_token: str) -> Option
         headers={
             "Authorization": f"Bearer {api_token}",
             "Content-Type": "application/json",
+            "User-Agent": "SapaadSupportAI/1.0",
         },
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=6) as resp:
+        with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         vec = np.array(data["result"]["data"][0], dtype=np.float32)
         norm = np.linalg.norm(vec)
-        return (vec / norm) if norm > 0 else None
-    except Exception:
-        return None
+        return ((vec / norm) if norm > 0 else None), ""
+    except Exception as e:
+        return None, str(e)
 
 
 # ================= 5. SMART BM25+ / HYBRID RRF RETRIEVAL =================
@@ -420,8 +423,9 @@ def retrieve_context(
     # 3. Optional Hybrid Semantic Fusion (Cloudflare bge-m3 + precomputed .npy)
     used_hybrid = False
     top_cosine = 0.0
+    cf_error = ""
     if index_bundle.get("hybrid_ready") and cf_account_id and cf_api_token:
-        q_vec = embed_query_cloudflare(clean_for_index(query), cf_account_id, cf_api_token)
+        q_vec, cf_error = embed_query_cloudflare(clean_for_index(query), cf_account_id, cf_api_token)
         if q_vec is not None:
             used_hybrid = True
             sims = index_bundle["emb_matrix"] @ q_vec  # Fast vectorized dot product (~4ms)
