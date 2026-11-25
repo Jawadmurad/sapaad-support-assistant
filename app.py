@@ -42,6 +42,8 @@ CF_API_TOKEN = get_secret("CF_API_TOKEN")
 LOCAL_DATA_DIR = "data"
 
 MAX_CONTEXT_CHARS = 10800
+
+
 def build_budgeted_context(matches: list[dict], customer_email: str, agent_notes: str, language: str) -> str:
     """Dynamically cap retrieved context based on Arabic vs English token density (~2.2 vs ~3.8 chars/token)."""
     combined_in = f"{customer_email}\n{agent_notes}"
@@ -64,6 +66,7 @@ def build_budgeted_context(matches: list[dict], customer_email: str, agent_notes
         chunks.append(snippet)
         used_chars += len(snippet) + 8
     return "\n\n---\n\n".join(chunks)
+
 
 MODELS = {
     "Groq: GPT-OSS 120B (Best Quality)": ("groq", "openai/gpt-oss-120b"),
@@ -719,18 +722,6 @@ with col2:
                     matches, search_meta = [], {}
 
                 context_block = build_budgeted_context(matches, customer_email, agent_notes, language)
-                used_chars = 0
-                for m in matches:
-                    snippet = f"[{m['type']} | {m['source']}]\n{m['text']}"
-                    if used_chars + len(snippet) > MAX_CONTEXT_CHARS:
-                        remaining = MAX_CONTEXT_CHARS - used_chars
-                        if remaining > 350:
-                            context_chunks = []
-                            context_chunks.append(snippet[:remaining] + "...")
-                        break
-                    context_chunks.append(snippet)
-                    used_chars += len(snippet) + 8
-                context_block = "\n\n---\n\n".join(context_chunks)
 
                 lang_rule = (
                     "Match the customer's language (English or Arabic)."
@@ -843,5 +834,3 @@ with col2:
                     st.markdown(f"**[{m['type']}] {m['title']}** *({m['source']})*{matched_tag}")
                     st.caption(m["text"][:450] + ("..." if len(m["text"]) > 450 else ""))
                     st.divider()
-
-
