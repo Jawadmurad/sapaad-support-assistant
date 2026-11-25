@@ -1,15 +1,18 @@
-import glob
-import html as html_lib
+import html
 import json
 import os
 import re
 import urllib.error
 import urllib.request
+
 import streamlit as st
 import streamlit.components.v1 as components
 from groq import Groq
-from huggingface_hub import snapshot_download
-from rank_bm25 import BM25Okapi
+
+from retrieval import (
+    build_search_index as _build_retrieval_index,
+    retrieve_context as _smart_retrieve_context,
+)
 
 # ================= CONFIGURATION =================
 st.set_page_config(
@@ -22,10 +25,10 @@ st.set_page_config(
 def get_secret(name: str, default: str = "") -> str:
     try:
         if name in st.secrets:
-            return str(st.secrets[name]).strip()
+            return str(st.secrets[name])
     except Exception:
         pass
-    return os.environ.get(name, default).strip()
+    return os.environ.get(name, default)
 
 
 GROQ_API_KEY = get_secret("GROQ_API_KEY")
@@ -33,387 +36,98 @@ GEMINI_API_KEY = get_secret("GEMINI_API_KEY")
 HF_TOKEN = get_secret("HF_TOKEN")
 HF_DATASET_REPO = get_secret("HF_DATASET_REPO")
 TEAM_PASSWORD = get_secret("TEAM_PASSWORD")
+CF_ACCOUNT_ID = get_secret("CF_ACCOUNT_ID")
+CF_API_TOKEN = get_secret("CF_API_TOKEN")
 LOCAL_DATA_DIR = "data"
 
 MAX_CONTEXT_CHARS = 10800
 
-# Model choices (provider, model_id)
 MODELS = {
     "Groq: GPT-OSS 120B (Best Quality)": ("groq", "openai/gpt-oss-120b"),
     "Groq: Qwen 3.8 27B (Strong Arabic/EN)": ("groq", "qwen/qwen3.8-27b"),
     "Groq: GPT-OSS 20B (Ultra-Fast)": ("groq", "openai/gpt-oss-20b"),
-    "Gemini: 2.5 Flash (Strong Fallback / Arabic)": ("gemini", "gemini-2.5-flash"),
+    "Gemini: 2.5 Flash (High Quality)": ("gemini", "gemini-2.5-flash"),
     "Gemini: 2.5 Flash-Lite (Fast Fallback)": ("gemini", "gemini-2.5-flash-lite"),
 }
-
-# Automatic fallback order for main generation
-FALLBACK_CHAIN = [
-    ("groq", "openai/gpt-oss-120b"),
-    ("groq", "qwen/qwen3.8-27b"),
-    ("groq", "openai/gpt-oss-20b"),
-    ("gemini", "gemini-2.5-flash"),
-    ("gemini", "gemini-2.5-flash-lite"),
-]
-
-# Query extractor fallback order (uses fast/separate bucket first)
-EXTRACTOR_CHAIN = [
-    ("groq", "openai/gpt-oss-20b"),
-    ("groq", "qwen/qwen3.8-27b"),
-    ("gemini", "gemini-2.5-flash-lite"),
-    ("gemini", "gemini-2.5-flash"),
-]
-
-OVERVIEW_KB_FILES = {"subscription.md", "general.md", "about.md"}
 
 SYSTEM_PROMPT = """You are a Sapaad Customer Support email assistant. Your job is to draft customer replies, refine rough drafts, and write internal Groove ticket notes using the provided Sapaad Knowledge Base (KB) and historical Groove Support Tickets as your primary references.
 
 1. SOURCE PRIORITY & ACCURACY
-- Always ground your answer in the provided REFERENCE CONTEXT. Never invent Sapaad features, menu paths, pricing, third-party provider names, API keys, or policies.
-- Prioritize Sapaad KB articles for official step-by-step navigation paths and product rules.
+- Always ground your answer in the provided REFERENCE CONTEXT. Never invent Sapaad features, menu paths, buttons, pricing, API-key steps, third-party providers, or policies.
+- Prioritize Official Policies (if present) and Sapaad KB articles for step-by-step navigation paths and product rules.
 - Use historical Groove tickets for real-world edge cases, troubleshooting workarounds, and Sapaad's standard support phrasing.
 - Prioritize recent tickets (2025–2026) over older tickets (2023–2024). Always recommend AnyDesk (never TeamViewer) for remote support, and use the current Cloud Print Agent link (prints.sapaad.com/getcpa).
-- NEVER invent or guess Sapaad menu paths (`>`), settings, or button names—not even for prerequisite steps (e.g., if the context mentions creating a surcharge without giving its exact menu path, state the prerequisite clearly without inventing a `>` path). ONLY include a `>` menu path if it explicitly appears in the REFERENCE CONTEXT below.
-- Always keep Sapaad UI menu paths and product names in their exact original English (e.g., **Setup > Location Setup > Self Ordering Systems > Sapaad Direct**) even when replying in Arabic, with ZERO mixed-script typos.
-- Do NOT assume the customer is on a "Lite" plan unless they explicitly say so; provide the standard setup steps first and mention plan tiers only as a brief note if relevant.
-- Factual accuracy ALWAYS overrides "guide alone" instructions: if a feature is unsupported or requires Sapaad backend action (such as open APIs or backend integrations), state that limitation clearly instead of inventing self-serve steps.
-- If the context does not clearly confirm an answer or requires account-level checking, add a short "[Agent Note: ...]" line at the very top BEFORE the email greeting.
+- NEVER invent or guess Sapaad menu paths, settings, or button names—not even for prerequisite steps (such as adding a surcharge). ONLY include a `>` menu path if that exact path appears in the REFERENCE CONTEXT below.
+- Always keep Sapaad UI menu paths in their original English (e.g., **Setup > Location Setup > Self Ordering Systems > Sapaad Direct**) even when replying in Arabic, because the Sapaad interface is in English. Never mix Arabic and English characters inside the same word (e.g., never write "Sapaاد").
+- Obey AGENT INSTRUCTIONS strictly regarding how to handle the customer (e.g., whether to promise a callback/account check or guide them step-by-step), while keeping the tone warm and polite—never leak harsh internal phrasing to the customer. However, factual accuracy ALWAYS overrides self-serve instructions: if a detail is not in the REFERENCE CONTEXT, do NOT fabricate steps.
+- If the context does not clearly confirm an answer or requires account-level checking, add a short `[Agent Note: ...]` line at the very top BEFORE the greeting explaining what the agent should verify internally, and keep the email body polite and accurate.
 
-2. AGENT INSTRUCTIONS PRIORITY & TONE SAFETY
-- Strictly obey any AGENT INSTRUCTIONS provided by the support agent (e.g., do not offer a meeting, do not promise to check their account).
-- Follow agent instructions SILENTLY and NATURALLY—never leak abrupt internal instructions into the customer email (e.g., never tell the customer "without needing a meeting or review from our side"; instead say warmly "Below are the direct steps so you can configure each item easily").
-
-3. PRIVACY & PLACEHOLDER SAFETY
+2. PRIVACY & PLACEHOLDER SAFETY
 - NEVER copy redacted placeholders ([PHONE_OR_ID], [EMAIL]), other customers' names, restaurant names, passwords, or expired Zoom/WeTransfer links from past tickets into a new draft.
 - Use clean bracketed placeholders like [Zoom Link] or [Date & Time] only if the agent hasn't provided them.
 
-4. TONE, LANGUAGE & RICH GROOVE FORMATTING
+3. TONE, LANGUAGE & GROOVE FORMATTING
 - Always write in the "we" tone (representing the Sapaad Support Team), polite, clear, and concise.
 - Match the requested or customer's language (English or Arabic).
-- In Arabic replies, use consistent respectful plural addressing throughout (e.g., افتحوا، اختاروا، انتقلوا، اضغطوا، حرّروا، احفظوا، قوموا — never mix singular and plural verbs, and spell واختاروا correctly).
-- Greeting:
+- For Arabic replies, consistently use respectful plural addressing throughout (e.g., قوموا، اختاروا، اضغطوا، حرّروا، تواصلوا) and avoid singular/plural mixing or spelling slips (use واختاروا, not واختروا).
+- Greeting (Customer Emails Only):
   - English: "Dear [Customer Name]," or "Hi [Customer Name]," (use "Hi," if no name is provided).
-  - Arabic: Always start with "السلام عليكم،" followed by a blank line and a brief 1-sentence warm opening before numbered points.
-- Mandatory Closing (Customer Emails Only — include ONCE, with NO duplicate closing sentence right above it):
+  - Arabic: "السلام عليكم،"
+- Follow the greeting with a brief, polite 1-sentence opening line before jumping into numbered points.
+- Mandatory Closing (Customer Emails Only — include ONCE only, never add a second similar closing sentence above it):
   - English: End every customer email with exactly:
     Please feel free to write to us for any further assistance.
   - Arabic: End every customer email with exactly:
     لا تترددوا بالتواصل معنا لأي مساعدة إضافية.
 - NO sign-off or signature: Never add "Best regards,", "Thanks,", or an agent name at the bottom (Groove appends the signature automatically).
-- RICH FORMATTING FOR GROOVE (the app converts this cleanly into Groove rich text):
-  - Use **bold** professionally for Sapaad menu paths (e.g., **Setup > Location Setup**), button/option names, and short topic titles.
-  - Use clean numbered lists (`1.`, `2.`, `3.`) for multi-part answers or step-by-step instructions, and bullet points (`- `) for sub-items or feature lists.
-  - Use blank lines between paragraphs and sections for clean visual spacing.
-  - Do NOT use `#` / `###` Markdown headers, Markdown tables, or backticks (`).
+- GROOVE-READY FORMATTING:
+  - Use **bold** sparingly and cleanly for Sapaad menu paths, key settings, button names, and short numbered point titles.
+  - Use clean numbered lists (1., 2., 3.) for multi-part inquiries or sequential steps, and simple hyphen bullets (- ) for sub-items.
+  - Separate paragraphs and numbered sections with a single blank line.
+  - NEVER use Markdown headers (###), code blocks, backticks (`), or tables.
 """
 
-REFINE_SYSTEM_PROMPT = """You are a senior Sapaad Customer Support editor. Your job is to polish and elevate an agent's rough draft into a clear, warm, professional Sapaad Support email ready to paste into Groove.
+REFINE_SYSTEM_PROMPT = """You are a senior Sapaad Customer Support editor refining an agent's rough email draft for Groove.
 
 RULES:
-- Preserve EVERY fact, date, time, link, thank-you sentence, and commitment from the agent's rough draft. Do NOT drop sentences or invent new promises.
-- Genuinely improve grammar, clarity, flow, and professional "we" tone (representing the Sapaad Support Team).
-- Keep Sapaad UI names and menu paths in English even when refining an Arabic email.
-- In Arabic, use consistent respectful plural addressing (e.g., تفضلوا، يرجى، يسعدنا، يمكنكم).
-- Apply proper greeting ("Hi [Name]," / "Dear [Name]," / "السلام عليكم،") and the exact mandatory closing line once at the end:
-  - English: Please feel free to write to us for any further assistance.
-  - Arabic: لا تترددوا بالتواصل معنا لأي مساعدة إضافية.
-- Use clean **bold** for key details (like dates, menu paths, or meeting labels), numbered lists (`1.`, `2.`) or bullet points (`- `) where helpful, and blank lines between paragraphs.
-- NO sign-off ("Best regards,", agent name), NO `###` headers, and NO backticks.
+- Preserve EVERY fact, date, time, link, placeholder, thank-you line, and commitment from the agent's rough draft. Do NOT drop details or add new promises.
+- Significantly elevate clarity, grammar, flow, and polite Sapaad Support "we" tone.
+- Match the language of the rough draft (or the requested output language).
+- For Arabic drafts, use natural, professional business Arabic with consistent respectful plural addressing (قوموا، اختاروا، تواصلوا).
+- Apply Sapaad greeting rules ("Hi [Name]," / "Dear [Name]," / "السلام عليكم،") and the exact mandatory closing line once ("Please feel free to write to us for any further assistance." or "لا تترددوا بالتواصل معنا لأي مساعدة إضافية."). Never add a sign-off or agent signature.
+- Use clean **bold** for key paths/dates/actions and clean numbered or bulleted lists where helpful. Never use ### headers, backticks, or tables.
+- If REFERENCE CONTEXT is provided, verify Sapaad UI menu paths against it and keep UI paths in English.
 """
 
 
-# ================= SMART BM25+ CLEANING & SYNONYMS =================
-BOILERPLATE_PATTERNS = [
-    r"Did you know Sapaad is integrated with.*?(?=\n|$)",
-    r"Global Support Numbers:.*?(?=\n|$)",
-    r"NOTICE:\s*This electronic mail message.*$",
-    r"CONFIDENTIALITY CAUTION:.*$",
-    r"This email(?: and any attachments)? may contain confidential.*$",
-    r"قد تحتوي هذه الرسالة الإلكترونية على معلومات سرية.*$",
-    r"Sent from (?:my iPhone|my iPad|Outlook for \w+|Yahoo Mail|Mail for Windows|Samsung).*",
-    r"Get Outlook for (?:iOS|Android).*",
-    r"Please reconsider not printing out this email.*",
-    r"\[PHONE_OR_ID\]|\[EMAIL\]",
-]
-
-GENERIC_RESOLUTION_PATTERNS = [
-    r"could you please (?:further )?elaborate",
-    r"share the (?:name of your restaurant|registered email)",
-    r"forwarded your (?:details|request) to our sales team",
-    r"remotely connected to your (?:system|device) via anydesk and assisted",
-    r"contacted you and assisted you with your (?:query|requirement)",
-    r"tried (?:reaching|calling) you.*unable to get through",
-    r"kindly share your anydesk id",
-]
-
-# Static local Sapaad synonym dictionary (0 tokens, <1ms)
-SAPAAD_SYNONYMS = {
-    "receipt machine": "thermal printer cloud print agent",
-    "receipt printer": "thermal printer cloud print agent printing rules",
-    "bill printer": "thermal printer receipt print",
-    "kitchen printer": "kot kitchen slip printing rules cloud print agent",
-    "not printing": "cloud print agent cpa printing rules printer",
-    "kitchen screen": "kds kitchen display system",
-    "cancel item": "void item cancel order",
-    "delete item": "void remove menu item",
-    "delivery apps": "aggregators urbanpiper atlas sapaad connect",
-    "talabat": "urbanpiper atlas aggregator talabat",
-    "deliveroo": "urbanpiper atlas sapaad connect deliveroo",
-    "noon": "urbanpiper atlas noon food",
-    "careem": "urbanpiper atlas careem",
-    "online store": "sapaad.online online ordering",
-    "website ordering": "sapaad.online online ordering",
-    "qr menu": "sapaad direct qr code table qr",
-    "table ordering": "sapaad direct qr code dine in",
-    "waiter button": "waiter hailing sapaad direct",
-    "whatsapp otp": "email otp sms otp guest checkout",
-    "no otp": "guest checkout disable otp checkout mode",
-    "cash on delivery": "pay at counter cash on delivery payment types",
-    "cod": "pay at counter cash on delivery",
-    "zatca": "zatca phase 2 e-invoicing fatoora",
-    "fatoora": "zatca phase 2 e-invoicing",
-    "add branch": "add location subscription upgrade",
-    "new branch": "add location subscription upgrade",
-    "loyalty": "loyalty points rewards expiry",
-    "inventory": "inventory track stock ingredients recipes stock take",
-    "quickbooks": "quickbooks accounting sync integration",
-    "xero": "xero accounting sync integration",
-    "delivery fee": "delivery areas surcharge default delivery fee",
-    "scheduled order": "accept scheduled orders pre-order sapaad.online",
-    "api": "sapaad connect api integration logistics partners",
-}
-
-
-def clean_for_index(text: str) -> str:
-    """Remove noisy signatures, disclaimers, and normalize common Sapaad typos."""
-    cleaned = text
-    for pat in BOILERPLATE_PATTERNS:
-        cleaned = re.sub(pat, " ", cleaned, flags=re.IGNORECASE | re.DOTALL)
-    cleaned = re.sub(r"\b(saapad|sappad|spaad|sapad)\b", "sapaad", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\bquickbook\b", "quickbooks", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\burban\s+piper\b", "urbanpiper", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\bany\s+desk\b", "anydesk", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\s+", " ", cleaned)
-    return cleaned.strip()
-
-
-def expand_synonyms(query: str) -> str:
-    """Append Sapaad-native synonyms locally without using LLM tokens."""
-    q_lower = query.lower()
-    additions = []
-    for trigger, expansion in SAPAAD_SYNONYMS.items():
-        if trigger in q_lower:
-            additions.append(expansion)
-    if additions:
-        return f"{query} " + " ".join(additions)
-    return query
-
-
-def tokenize(text: str) -> list[str]:
-    return re.findall(r"[\w\u0600-\u06FF]+", text.lower())
-
-
-def split_ticket_parts(body: str) -> tuple[str, str]:
-    """Split a ticket body into (customer_part, resolution_part)."""
-    match = re.search(r"\*\*Support Resolution:\*\*|Support Resolution:", body, re.IGNORECASE)
-    if not match:
-        return body.strip(), ""
-    customer_part = body[:match.start()].strip()
-    resolution_part = body[match.end():].strip()
-    customer_part = re.sub(r"^\*\*Customer:\*\*\s*|Customer:\s*", "", customer_part, flags=re.IGNORECASE).strip()
-    return customer_part, resolution_part
-
-
-def compute_ticket_weight(resolution_part: str, year: int) -> float:
-    """Score ticket reliability based on recency and resolution substance."""
-    if not resolution_part or len(resolution_part) < 35:
-        return 0.0  # Skip unresolved or empty-resolution tickets
-
-    base = 1.25 if year >= 2025 else 0.85
-    if len(resolution_part) < 70:
-        return base * 0.40
-
-    if len(resolution_part) < 350:
-        for pat in GENERIC_RESOLUTION_PATTERNS:
-            if re.search(pat, resolution_part, re.IGNORECASE):
-                return base * 0.45
-
-    return base
-
-
-def format_ticket_for_context(header: str, customer_part: str, resolution_part: str) -> str:
-    """Context Diet: keep customer summary concise so the full resolution is never cut off."""
-    cust_short = clean_for_index(customer_part)[:420]
-    res_clean = resolution_part[:1600].strip()
-    return f"{header}\nCustomer Issue: {cust_short}\nSupport Resolution:\n{res_clean}"
-
-
-# ================= DATA LOADING & INDEXING =================
-def load_data_directory() -> str:
-    """Use local ./data folder if present, otherwise download from Private HF Dataset."""
-    if os.path.isdir(LOCAL_DATA_DIR) and glob.glob(os.path.join(LOCAL_DATA_DIR, "*.md")):
-        return LOCAL_DATA_DIR
-
-    if HF_DATASET_REPO and HF_TOKEN:
-        cache_dir = "/tmp/sapaad_data"
-        snapshot_download(
-            repo_id=HF_DATASET_REPO,
-            repo_type="dataset",
-            token=HF_TOKEN,
-            local_dir=cache_dir,
-            allow_patterns=["*.md"],
-        )
-        return cache_dir
-
-    return ""
-
-
-def chunk_kb_article(title: str, body: str, max_chunk: int = 1900, overlap: int = 250) -> list[str]:
-    """Split long KB articles into overlapping chunks so bottom sections aren't lost."""
-    body = body.strip()
-    if len(body) <= max_chunk:
-        return [body]
-    chunks = []
-    start = 0
-    while start < len(body):
-        end = start + max_chunk
-        chunks.append(body[start:end].strip())
-        if end >= len(body):
-            break
-        start = end - overlap
-    return chunks
-
-
+# ================= INDEX LOADING (DELEGATED TO retrieval.py) =================
 @st.cache_resource(show_spinner="Indexing Sapaad KB & Support Tickets (Smart BM25+)...")
-def build_search_index():
-    data_dir = load_data_directory()
-    if not data_dir:
-        return None, [], 0, 0, 0
-
-    docs = []
-    corpus = []
-    kb_count = 0
-    ticket_count = 0
-    skipped_tickets = 0
-
-    for filepath in sorted(glob.glob(os.path.join(data_dir, "*.md"))):
-        filename = os.path.basename(filepath)
-        is_ticket_file = filename.lower().startswith("tickets_")
-
-        with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
-            content = f.read()
-
-        if is_ticket_file:
-            parts = re.split(r"(?m)^#{3,5}\s+(Ticket\s+#\d+[^\n]*)", content)
-            for i in range(1, len(parts), 2):
-                header = parts[i].strip()
-                body = parts[i + 1].strip() if i + 1 < len(parts) else ""
-                if len(body) < 40:
-                    skipped_tickets += 1
-                    continue
-
-                customer_part, resolution_part = split_ticket_parts(body)
-                year_match = re.search(r"\((\d{4})-", header)
-                year = int(year_match.group(1)) if year_match else 2024
-                weight = compute_ticket_weight(resolution_part, year)
-
-                if weight <= 0.0:
-                    skipped_tickets += 1
-                    continue
-
-                clean_title = clean_for_index(header)
-                clean_cust = clean_for_index(customer_part)[:600]
-                clean_res = clean_for_index(resolution_part)[:1600]
-
-                # BM25F-style field boosting: Title 3x, Customer Issue 2x, Resolution 1x
-                indexed_text = f"{clean_title} {clean_title} {clean_title} {clean_cust} {clean_cust} {clean_res}"
-
-                docs.append({
-                    "source": filename,
-                    "title": header,
-                    "type": "Ticket",
-                    "year": year,
-                    "weight": weight,
-                    "text": format_ticket_for_context(header, customer_part, resolution_part),
-                })
-                corpus.append(tokenize(indexed_text))
-                ticket_count += 1
-        else:
-            kb_weight = 1.05 if filename.lower() in OVERVIEW_KB_FILES else 1.40
-            parts = re.split(r"(?m)^#{2,4}\s+([^\n]+)", content)
-            if len(parts) > 2:
-                for i in range(1, len(parts), 2):
-                    title = parts[i].strip()
-                    body = parts[i + 1].strip() if i + 1 < len(parts) else ""
-                    if len(body) < 35:
-                        continue
-                    if "Total Articles:" in body[:250] or "Consolidated Knowledge Base" in body[:250]:
-                        continue
-
-                    for c_idx, chunk in enumerate(chunk_kb_article(title, body)):
-                        chunk_title = title if c_idx == 0 else f"{title} (Part {c_idx + 1})"
-                        clean_title = clean_for_index(title)
-                        clean_body = clean_for_index(chunk)
-                        indexed_text = f"{clean_title} {clean_title} {clean_title} {clean_body}"
-
-                        docs.append({
-                            "source": filename,
-                            "title": chunk_title,
-                            "type": "KB",
-                            "year": 2026,
-                            "weight": kb_weight,
-                            "text": f"KB Article: {chunk_title}\n{chunk}",
-                        })
-                        corpus.append(tokenize(indexed_text))
-                        kb_count += 1
-            elif len(content.strip()) > 35:
-                clean_body = clean_for_index(content[:2500])
-                docs.append({
-                    "source": filename,
-                    "title": filename,
-                    "type": "KB",
-                    "year": 2026,
-                    "weight": kb_weight,
-                    "text": content[:2500],
-                })
-                corpus.append(tokenize(f"{filename} {filename} {clean_body}"))
-                kb_count += 1
-
-    if not docs:
-        return None, [], 0, 0, skipped_tickets
-
-    bm25 = BM25Okapi(corpus)
-    return bm25, docs, kb_count, ticket_count, skipped_tickets
+def load_index():
+    return _build_retrieval_index(LOCAL_DATA_DIR, HF_DATASET_REPO, HF_TOKEN)
 
 
-# ================= MULTI-PROVIDER LLM ENGINE (GROQ + GEMINI) =================
+# ================= MULTI-PROVIDER LLM LAYER (GROQ -> GEMINI) =================
 def _call_groq_raw(model_id: str, system_prompt: str, user_prompt: str, temperature: float, max_tokens: int) -> str:
-    if not GROQ_API_KEY:
-        raise RuntimeError("GROQ_API_KEY not configured")
     client = Groq(api_key=GROQ_API_KEY)
     messages = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": user_prompt})
-
     resp = client.chat.completions.create(
         model=model_id,
         messages=messages,
         temperature=temperature,
         max_tokens=max_tokens,
     )
-    content = (resp.choices[0].message.content or "").strip()
-    if not content:
-        raise RuntimeError(f"Empty response from Groq model {model_id}")
-    return content
+    return (resp.choices[0].message.content or "").strip()
 
 
 def _call_gemini_raw(model_id: str, system_prompt: str, user_prompt: str, temperature: float, max_tokens: int) -> str:
-    """Zero-dependency Gemini REST API call using Python stdlib urllib."""
-    if not GEMINI_API_KEY:
-        raise RuntimeError("GEMINI_API_KEY not configured")
-
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent"
-    payload = {
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{model_id}:generateContent?key={GEMINI_API_KEY}"
+    )
+    payload: dict = {
         "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
         "generationConfig": {
             "temperature": temperature,
@@ -421,535 +135,400 @@ def _call_gemini_raw(model_id: str, system_prompt: str, user_prompt: str, temper
         },
     }
     if system_prompt:
-        payload["system_instruction"] = {"parts": [{"text": system_prompt}]}
+        payload["systemInstruction"] = {"parts": [{"text": system_prompt}]}
 
     req = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "x-goog-api-key": GEMINI_API_KEY,
-        },
+        headers={"Content-Type": "application/json"},
         method="POST",
     )
-
     try:
         with urllib.request.urlopen(req, timeout=45) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
-        err_body = e.read().decode("utf-8", errors="ignore")
-        raise RuntimeError(f"Gemini HTTP {e.code}: {err_body[:300]}") from e
+        err_body = e.read().decode("utf-8", errors="ignore")[:300]
+        raise RuntimeError(f"Gemini HTTP {e.code}: {err_body}") from e
 
     candidates = data.get("candidates") or []
     if not candidates:
-        raise RuntimeError(f"Gemini returned no candidates: {str(data)[:200]}")
+        raise RuntimeError(f"Gemini returned no candidates: {data}")
     parts = (candidates[0].get("content") or {}).get("parts") or []
-    text = "".join(p.get("text", "") for p in parts).strip()
+    text = "".join(p.get("text", "") for p in parts if "text" in p).strip()
     if not text:
-        raise RuntimeError(f"Empty text from Gemini model {model_id}")
+        raise RuntimeError("Gemini returned empty text.")
     return text
 
 
-def call_provider(provider: str, model_id: str, system_prompt: str, user_prompt: str, temperature: float, max_tokens: int) -> str:
-    if provider == "groq":
-        return _call_groq_raw(model_id, system_prompt, user_prompt, temperature, max_tokens)
-    if provider == "gemini":
-        return _call_gemini_raw(model_id, system_prompt, user_prompt, temperature, max_tokens)
-    raise ValueError(f"Unknown provider: {provider}")
-
-
-# ================= SMART BYPASS & QUERY EXTRACTION =================
-def should_bypass_llm_extraction(text: str) -> bool:
-    """Skip LLM query extraction for short, single-topic English emails (saves ~35% tokens)."""
-    stripped = text.strip()
-    if not stripped or len(stripped) > 350:
-        return False
-    if re.search(r"[\u0600-\u06FF]", stripped):
-        return False
-    bullet_lines = re.findall(r"(?m)^\s*(?:\d+[\.\)]|[-•*])\s+", stripped)
-    if len(bullet_lines) >= 2 or stripped.count("?") >= 2:
-        return False
-    return True
-
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def extract_english_subqueries(text: str, draft_model_id: str) -> tuple[list[str], str]:
-    """Translate & split Arabic/multi-topic emails into Sapaad-native English queries with Groq->Gemini fallback."""
-    if should_bypass_llm_extraction(text):
-        cleaned = expand_synonyms(clean_for_index(text))
-        return [cleaned], "Smart Bypass (0 tokens)"
-
-    chain = [item for item in EXTRACTOR_CHAIN if item[1] != draft_model_id] + [
-        item for item in EXTRACTOR_CHAIN if item[1] == draft_model_id
+def build_fallback_chain(primary_provider: str, primary_model: str) -> list[tuple[str, str]]:
+    candidates = [
+        (primary_provider, primary_model),
+        ("groq", "openai/gpt-oss-20b"),
+        ("groq", "qwen/qwen3.8-27b"),
+        ("gemini", "gemini-2.5-flash"),
+        ("gemini", "gemini-2.5-flash-lite"),
     ]
+    chain = []
+    seen = set()
+    for prov, mod in candidates:
+        if (prov, mod) in seen:
+            continue
+        if prov == "groq" and not GROQ_API_KEY:
+            continue
+        if prov == "gemini" and not GEMINI_API_KEY:
+            continue
+        seen.add((prov, mod))
+        chain.append((prov, mod))
+    return chain
 
-    extractor_prompt = (
-        "You are a search query extractor for Sapaad POS support documentation.\n"
-        "Read the customer email below (Arabic or English) and extract EACH distinct support topic "
-        "as a separate short ENGLISH search query (3 to 7 English keywords per line). "
-        "Do NOT merge two different questions into one line.\n"
+
+def call_llm(
+    primary_provider: str,
+    primary_model: str,
+    system_prompt: str,
+    user_prompt: str,
+    temperature: float = 0.25,
+    max_tokens: int = 3000,
+) -> tuple[str, str]:
+    chain = build_fallback_chain(primary_provider, primary_model)
+    if not chain:
+        raise RuntimeError("No API keys configured. Add GROQ_API_KEY and/or GEMINI_API_KEY in Secrets.")
+
+    errors = []
+    for idx, (prov, mod) in enumerate(chain):
+        try:
+            if prov == "groq":
+                out = _call_groq_raw(mod, system_prompt, user_prompt, temperature, max_tokens)
+            else:
+                out = _call_gemini_raw(mod, system_prompt, user_prompt, temperature, max_tokens)
+            if not out:
+                raise RuntimeError("Model returned empty output.")
+            label = f"{prov}:{mod}" if idx == 0 else f"{prov}:{mod} (auto-fallback)"
+            return out, label
+        except Exception as e:
+            errors.append(f"{prov}:{mod} -> {e}")
+            continue
+
+    raise RuntimeError("All configured LLM providers failed:\n" + "\n".join(errors))
+
+
+# ================= MULTI-TOPIC ENGLISH QUERY EXTRACTOR =================
+def extract_english_subqueries(
+    text: str,
+    draft_provider: str,
+    draft_model: str,
+) -> tuple[list[str], str]:
+    """Translate and split Arabic or multi-point emails into focused English Sapaad search queries."""
+    # Pick a fast model separate from the drafting model to avoid Groq 8k TPM collisions
+    if draft_provider == "groq":
+        if draft_model == "openai/gpt-oss-20b":
+            q_candidates = [("groq", "qwen/qwen3.8-27b"), ("gemini", "gemini-2.5-flash-lite"), ("gemini", "gemini-2.5-flash")]
+        else:
+            q_candidates = [("groq", "openai/gpt-oss-20b"), ("gemini", "gemini-2.5-flash-lite"), ("gemini", "gemini-2.5-flash")]
+    else:
+        q_candidates = [("gemini", "gemini-2.5-flash-lite"), ("groq", "openai/gpt-oss-20b"), ("gemini", "gemini-2.5-flash")]
+
+    prompt = (
+        "You are a search query generator for Sapaad POS support documentation.\n"
+        "Read the customer email below (Arabic or English) and extract EVERY distinct support question or topic "
+        "as its own short ENGLISH search query (3 to 7 English keywords per line). NEVER merge two different "
+        "questions onto the same line.\n"
         "Use exact Sapaad terminology where relevant:\n"
-        "- QR table ordering -> Sapaad Direct QR code setup\n"
-        "- Waiter call button -> waiter hailing Sapaad Direct\n"
-        "- Disable OTP / no OTP -> guest checkout Checkout Mode disable OTP\n"
-        "- WhatsApp OTP alternative -> enable Email OTP SMS\n"
-        "- Cash on delivery -> Pay at Counter Cash on Delivery payment types\n"
-        "- Scheduled / pre-orders -> Accept Scheduled Orders Sapaad.Online\n"
-        "- Delivery API / third-party courier -> Sapaad Connect logistics partners API integration\n"
-        "- Delivery fee per area -> Delivery Areas Delivery Fee surcharge\n"
-        "Output ONLY the English lines—no Arabic, no numbering, no bullets, no explanations. Max 10 lines.\n\n"
+        "- QR code for tables -> Sapaad Direct QR code setup generate table QR\n"
+        "- Call waiter button -> Sapaad Direct waiter hailing button\n"
+        "- Disable OTP / order without login -> Sapaad Direct guest checkout Checkout Mode disable OTP\n"
+        "- WhatsApp / SMS OTP alternative -> Sapaad Direct enable Email OTP SMS\n"
+        "- Cash on delivery / pay at counter -> Sapaad Direct Pay at Counter Cash on Delivery payment types\n"
+        "- Scheduled / pre-orders -> Sapaad.Online accept scheduled orders\n"
+        "- Delivery company API / external integration -> Sapaad Open API integration Sapaad Connect delivery partner\n"
+        "- Delivery fees per area / zone -> Sapaad.Online delivery areas delivery fee surcharge\n"
+        "Output ONLY the English query lines (max 10 lines). No Arabic, no numbering, no bullets, no explanations.\n\n"
         f"{text[:2600]}"
     )
 
-    last_err = None
-    for provider, model_id in chain:
-        if provider == "groq" and not GROQ_API_KEY:
+    for prov, mod in q_candidates:
+        if prov == "groq" and not GROQ_API_KEY:
             continue
-        if provider == "gemini" and not GEMINI_API_KEY:
+        if prov == "gemini" and not GEMINI_API_KEY:
             continue
         try:
-            raw = call_provider(provider, model_id, "", extractor_prompt, temperature=0.0, max_tokens=1200)
+            if prov == "groq":
+                raw = _call_groq_raw(mod, "", prompt, temperature=0.0, max_tokens=1600)
+            else:
+                raw = _call_gemini_raw(mod, "", prompt, temperature=0.0, max_tokens=500)
+
             lines = []
             for ln in raw.splitlines():
                 cleaned = re.sub(r"^[\d\.\-\•\*\s]+", "", ln).strip()
-                if cleaned and len(cleaned.split()) >= 2 and re.search(r"[a-zA-Z]{2,}", cleaned):
-                    lines.append(expand_synonyms(cleaned))
+                # Filter out non-English lines or truncated 1-word fragments
+                if len(cleaned.split()) >= 2 and re.search(r"[a-zA-Z]{2,}", cleaned):
+                    lines.append(cleaned)
             if lines:
-                return lines[:10], f"{provider}:{model_id}"
-        except Exception as e:
-            last_err = e
+                return lines[:10], f"{prov}:{mod}"
+        except Exception:
             continue
 
-    fallback_q = expand_synonyms(clean_for_index(text))
-    return [fallback_q], f"Fallback Raw ({str(last_err)[:60]})"
+    return [text], "Fallback (raw text)"
 
 
-# ================= SMART BM25+ WITH RRF RETRIEVAL =================
-def retrieve_context(bm25, docs, query: str, draft_model_id: str, top_k: int = 6):
-    """Smart BM25+ with Per-Topic Guarantee + Reciprocal Rank Fusion (RRF) + Context Budget."""
-    if not bm25 or not query.strip():
-        return [], [], "None"
+# ================= POST-PROCESSING & GROOVE HTML CONVERTER =================
+def split_agent_note_and_clean(text: str, mode: str, language_choice: str, customer_email: str) -> tuple[str, str]:
+    """Separate [Agent Note: ...] from the email body and apply Groove formatting safety guards."""
+    text = text.strip()
+    agent_notes = []
 
-    subqueries, extractor_used = extract_english_subqueries(query, draft_model_id)
-    is_multi_topic = len(subqueries) > 1
-    max_docs = max(top_k, min(11, len(subqueries) * 2)) if is_multi_topic else top_k
+    def _collect_note(match):
+        note_body = match.group(1).strip()
+        if note_body:
+            agent_notes.append(note_body)
+        return ""
 
-    rrf_scores = {}
-    k_rrf = 60
-    per_topic_priority = []
-    seen_priority = set()
+    text = re.sub(r"(?im)^\s*\[?Agent Note\s*:\s*([^\n\]]+)\]?\s*\n*", _collect_note, text)
 
-    for q in subqueries:
-        tokens = tokenize(q)
-        if not tokens:
-            continue
-        raw_scores = bm25.get_scores(tokens)
-        scored = [
-            (score * docs[idx]["weight"], idx)
-            for idx, score in enumerate(raw_scores)
-            if score > 0 and docs[idx]["weight"] > 0
-        ]
-        scored.sort(reverse=True)
-
-        for rank, (_, idx) in enumerate(scored[:25], start=1):
-            rrf_scores[idx] = rrf_scores.get(idx, 0.0) + (1.0 / (k_rrf + rank))
-
-        if is_multi_topic and scored:
-            for _, idx in scored[:5]:
-                if idx not in seen_priority:
-                    per_topic_priority.append(idx)
-                    seen_priority.add(idx)
-                    break
-
-    rrf_ranked = [idx for idx, _ in sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)]
-
-    selected = []
-    seen = set()
-    total_chars = 0
-    kb_count = 0
-    ticket_count = 0
-    kb_cap = max(4, max_docs // 2 + 1)
-
-    def try_add(idx: int, enforce_kb_cap: bool = True) -> bool:
-        nonlocal total_chars, kb_count, ticket_count
-        if idx in seen:
-            return False
-        doc = docs[idx]
-        if enforce_kb_cap and doc["type"] == "KB" and kb_count >= kb_cap and ticket_count == 0:
-            return False
-        doc_len = len(doc["text"])
-        if total_chars + doc_len > MAX_CONTEXT_CHARS and len(selected) >= 3:
-            return False
-        selected.append(doc)
-        seen.add(idx)
-        total_chars += doc_len
-        if doc["type"] == "KB":
-            kb_count += 1
-        else:
-            ticket_count += 1
-        return True
-
-    for idx in per_topic_priority:
-        if len(selected) >= max_docs:
-            break
-        try_add(idx, enforce_kb_cap=False)
-
-    for idx in rrf_ranked:
-        if len(selected) >= max_docs:
-            break
-        try_add(idx, enforce_kb_cap=True)
-
-    if len(selected) < top_k:
-        for idx in rrf_ranked:
-            if len(selected) >= top_k:
-                break
-            try_add(idx, enforce_kb_cap=False)
-
-    display_queries = [q[:90] + ("..." if len(q) > 90 else "") for q in subqueries]
-    return selected, display_queries, extractor_used
-
-
-# ================= OUTPUT CLEANING & GROOVE RICH HTML CONVERTER =================
-def extract_agent_note(text: str) -> tuple[str, str]:
-    """Separate any [Agent Note: ...] lines so Ready to Copy is 100% customer-safe."""
-    notes = re.findall(r"(?i)\[Agent Note:\s*([^\]]+)\]", text)
-    cleaned = re.sub(r"(?i)^\s*\[Agent Note:[^\]]+\]\s*\n*", "", text, flags=re.MULTILINE)
-    cleaned = re.sub(r"(?i)\[Agent Note:[^\]]+\]", "", cleaned)
-    return "\n".join(n.strip() for n in notes), cleaned.strip()
-
-
-def clean_for_groove(text: str, mode: str) -> str:
-    """Keep clean bold/lists/linebreaks for Groove rich text, while fixing headers/typos."""
-    # Convert ### headers to bold lines instead of raw hashes
-    text = re.sub(r"(?m)^#{1,6}\s+(.+)$", r"**\1**", text)
+    # Strip unwanted Markdown syntax while preserving **bold** and lists for Groove TinyMCE
+    text = re.sub(r"(?m)^#{1,6}\s+", "", text)
+    text = re.sub(r"```[a-zA-Z]*\n?", "", text)
     text = re.sub(r"`([^`]+)`", r"\1", text)
-
-    # Fix common mixed-script and Arabic spelling slips
-    text = re.sub(r"Sapa[\u0600-\u06FF]+", "Sapaad", text, flags=re.IGNORECASE)
-    text = text.replace("واختروا", "واختاروا")
-    text = text.replace("حرّرو ", "حرّروا ").replace("قموا ", "قوموا ")
-
-    # Normalize spacing while preserving intentional blank lines
+    text = re.sub(r"__(.*?)__", r"**\1**", text)
     text = re.sub(r"[ \t]+\n", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
+
+    # Catch rare mixed-script & Arabic spelling slips
+    text = re.sub(r"Sapa[\u0600-\u06FF]+", "Sapaad", text)
+    text = text.replace("واختروا", "واختاروا").replace("قموا", "قوموا")
     text = text.strip()
 
-    # Ensure Arabic customer replies start with السلام عليكم،
-    if mode in ("Draft Reply", "Refine Draft") and re.search(r"[\u0600-\u06FF]", text):
-        first_line = text.splitlines()[0].strip() if text else ""
-        if "السلام عليكم" not in first_line and "مرحباً" not in first_line and "مرحبا" not in first_line:
+    # Guarantee Arabic greeting on customer-facing Arabic drafts
+    if mode != "Internal Note / Summary":
+        is_arabic_output = (
+            language_choice == "Arabic"
+            or (language_choice == "Auto (Match Customer)" and bool(re.search(r"[\u0600-\u06FF]", text)))
+        )
+        if is_arabic_output and not re.match(r"^(\*\*)?السلام عليكم", text):
             text = f"السلام عليكم،\n\n{text}"
 
-    return text
+    return "\n".join(agent_notes).strip(), text
 
 
-def strip_markdown_plain(text: str) -> str:
-    """Create a clean plain-text fallback version (without ** markers)."""
-    plain = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
-    plain = re.sub(r"__(.*?)__", r"\1", plain)
-    plain = re.sub(r"(?<!\*)\*(?!\*)(.*?)(?<!\*)\*(?!\*)", r"\1", plain)
-    return plain.strip()
-
-
-def _format_inline_html(line: str) -> str:
-    """Convert inline Markdown (**bold**, *italic*, URLs) to Groove-safe HTML."""
-    escaped = html_lib.escape(line)
-    # Bold: **text** or __text__
-    escaped = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped)
-    escaped = re.sub(r"__(.+?)__", r"<strong>\1</strong>", escaped)
-    # Italic: *text* (avoid matching inside URLs or spaces)
-    escaped = re.sub(r"(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)", r"<em>\1</em>", escaped)
-    # Auto-link URLs cleanly
-    escaped = re.sub(
-        r"(https?://[^\s<]+?)(?=[.,;:!?)]*(?:\s|$|<))",
+def _format_inline_html(escaped_text: str) -> str:
+    """Convert **bold** and bare URLs inside already-escaped text to Groove TinyMCE HTML."""
+    formatted = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped_text)
+    formatted = re.sub(
+        r"(https?://[^\s<]+)",
         r'<a href="\1" target="_blank" rel="noopener noreferrer">\1</a>',
-        escaped,
+        formatted,
     )
-    return escaped
+    return formatted
 
 
-def markdown_to_groove_html(text: str) -> str:
-    """
-    Convert structured Markdown into TinyMCE / Groove-native HTML:
-    - Uses <div> and <div><br></div> so Groove preserves every single line break!
-    - Uses <strong>, <ol>, <ul>, <li>, <a> cleanly with zero background-color leakage.
-    """
+def markdown_to_groove_html(text: str) -> tuple[str, str, bool]:
+    """Convert draft into TinyMCE-compatible HTML (<div>, <div><br></div>, <strong>, <ol>, <ul>) + clean plain text."""
+    is_rtl = bool(re.search(r"[\u0600-\u06FF]", text))
     lines = text.splitlines()
-    out = []
-    in_ol = False
-    in_ul = False
-    pending_blank = False
+    html_parts = []
+    in_list = None  # "ol" or "ul"
 
-    def close_lists():
-        nonlocal in_ol, in_ul
-        if in_ul:
-            out.append("</ul>")
-            in_ul = False
-        if in_ol:
-            out.append("</ol>")
-            in_ol = False
+    def close_list():
+        nonlocal in_list
+        if in_list:
+            html_parts.append(f"</{in_list}>")
+            in_list = None
 
     for raw_line in lines:
-        line = raw_line.strip()
-
-        if not line:
-            close_lists()
-            if out:
-                pending_blank = True
+        stripped = raw_line.strip()
+        if not stripped:
+            close_list()
+            html_parts.append("<div><br></div>")
             continue
 
-        ol_match = re.match(r"^(\d+)[\.\)]\s+(.+)$", line)
-        ul_match = re.match(r"^[-•*]\s+(.+)$", line)
+        ol_match = re.match(r"^(\d+)[\.\)]\s+(.+)$", stripped)
+        ul_match = re.match(r"^[-•\*]\s+(.+)$", stripped)
 
         if ol_match:
-            num = int(ol_match.group(1))
-            content = _format_inline_html(ol_match.group(2))
-            if in_ul:
-                out.append("</ul>")
-                in_ul = False
-            if pending_blank and out:
-                out.append("<div><br></div>")
-                pending_blank = False
-            if not in_ol:
-                start_attr = f' start="{num}"' if num != 1 else ""
-                out.append(f"<ol{start_attr}>")
-                in_ol = True
-            out.append(f"<li>{content}</li>")
-
+            if in_list != "ol":
+                close_list()
+                html_parts.append("<ol>")
+                in_list = "ol"
+            item_html = _format_inline_html(html.escape(ol_match.group(2)))
+            html_parts.append(f"<li>{item_html}</li>")
         elif ul_match:
-            content = _format_inline_html(ul_match.group(1))
-            if in_ol:
-                out.append("</ol>")
-                in_ol = False
-            if pending_blank and out:
-                out.append("<div><br></div>")
-                pending_blank = False
-            if not in_ul:
-                out.append("<ul>")
-                in_ul = True
-            out.append(f"<li>{content}</li>")
-
+            if in_list != "ul":
+                close_list()
+                html_parts.append("<ul>")
+                in_list = "ul"
+            item_html = _format_inline_html(html.escape(ul_match.group(1)))
+            html_parts.append(f"<li>{item_html}</li>")
         else:
-            close_lists()
-            if pending_blank and out:
-                out.append("<div><br></div>")
-                pending_blank = False
-            out.append(f"<div>{_format_inline_html(line)}</div>")
+            close_list()
+            line_html = _format_inline_html(html.escape(stripped))
+            html_parts.append(f"<div>{line_html}</div>")
 
-    close_lists()
-    return "\n".join(out)
+    close_list()
+
+    dir_attr = ' dir="rtl"' if is_rtl else ""
+    align_style = "text-align: right; " if is_rtl else ""
+    groove_html = (
+        f'<div{dir_attr} style="font-family: Arial, Helvetica, sans-serif; '
+        f'font-size: 14px; line-height: 1.6; color: #1f2937; {align_style}">'
+        + "".join(html_parts)
+        + "</div>"
+    )
+
+    plain_text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+    return groove_html, plain_text, is_rtl
 
 
-def render_groove_copy_box(markdown_text: str):
-    """Render a white-paper rich-text email preview with 1-click Groove Rich-Text & Plain-Text Copy."""
-    groove_html = markdown_to_groove_html(markdown_text)
-    plain_text = strip_markdown_plain(markdown_text)
-    is_rtl = bool(re.search(r"[\u0600-\u06FF]", markdown_text))
-    dir_attr = "rtl" if is_rtl else "ltr"
+def render_groove_preview_and_copy(draft_text: str):
+    """Render white-background email preview + one-click TinyMCE HTML & Plain Text copy buttons."""
+    groove_html, plain_text, is_rtl = markdown_to_groove_html(draft_text)
+    groove_html_js = json.dumps(groove_html)
+    plain_text_js = json.dumps(plain_text)
+
+    dir_css = "rtl" if is_rtl else "ltr"
     align_css = "right" if is_rtl else "left"
-
-    # Estimate iframe height smoothly based on content length
-    line_count = max(8, markdown_text.count("\n") + len(markdown_text) // 75 + 4)
-    iframe_height = min(680, max(260, line_count * 24 + 90))
-
-    plain_json = json.dumps(plain_text)
+    line_count = max(10, draft_text.count("\n") + len(draft_text) // 75)
+    box_height = min(560, max(260, line_count * 24 + 90))
 
     component_html = f"""
     <!DOCTYPE html>
     <html>
     <head>
-    <meta charset="utf-8" />
-    <style>
-      * {{ box-sizing: border-box; }}
-      body {{
-        margin: 0;
-        padding: 0;
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
-        background: transparent;
-      }}
-      .toolbar {{
-        display: flex;
-        gap: 8px;
-        align-items: center;
-        margin-bottom: 10px;
-        flex-wrap: wrap;
-      }}
-      .btn {{
-        border: none;
-        border-radius: 6px;
-        padding: 8px 14px;
-        font-size: 13px;
-        font-weight: 600;
-        cursor: pointer;
-        transition: all 0.15s ease;
-        display: inline-flex;
-        align-items: center;
-        gap: 6px;
-      }}
-      .btn-primary {{
-        background: #ff4b4b;
-        color: #ffffff;
-      }}
-      .btn-primary:hover {{ background: #e03e3e; }}
-      .btn-secondary {{
-        background: #2b313e;
-        color: #f3f4f6;
-        border: 1px solid #444c5c;
-      }}
-      .btn-secondary:hover {{ background: #3b4252; }}
-      .status {{
-        font-size: 12.5px;
-        font-weight: 600;
-        color: #10b981;
-        margin-left: 4px;
-      }}
-      .paper {{
-        background-color: #ffffff;
-        color: #1f2937;
-        border: 1px solid #d1d5db;
-        border-radius: 8px;
-        padding: 18px 20px;
-        max-height: {iframe_height - 62}px;
-        overflow-y: auto;
-        font-size: 14px;
-        line-height: 1.65;
-        direction: {dir_attr};
-        text-align: {align_css};
-      }}
-      #groove-preview div {{
-        margin: 0;
-      }}
-      #groove-preview ol, #groove-preview ul {{
-        margin: 4px 0 8px 0;
-        padding-inline-start: 22px;
-      }}
-      #groove-preview li {{
-        margin-bottom: 4px;
-      }}
-      #groove-preview a {{
-        color: #2563eb;
-        text-decoration: underline;
-      }}
-    </style>
+      <meta charset="utf-8" />
+      <style>
+        * {{ box-sizing: border-box; }}
+        body {{
+          margin: 0;
+          padding: 2px;
+          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+          background: transparent;
+        }}
+        .toolbar {{
+          display: flex;
+          gap: 8px;
+          align-items: center;
+          margin-bottom: 10px;
+          flex-wrap: wrap;
+        }}
+        .btn-primary {{
+          background: #ff4b4b;
+          color: #ffffff;
+          border: none;
+          border-radius: 8px;
+          padding: 9px 16px;
+          font-size: 14px;
+          font-weight: 600;
+          cursor: pointer;
+          transition: background 0.15s ease;
+        }}
+        .btn-primary:hover {{ background: #e03e3e; }}
+        .btn-secondary {{
+          background: #f3f4f6;
+          color: #1f2937;
+          border: 1px solid #d1d5db;
+          border-radius: 8px;
+          padding: 9px 14px;
+          font-size: 13px;
+          font-weight: 500;
+          cursor: pointer;
+        }}
+        .btn-secondary:hover {{ background: #e5e7eb; }}
+        .status {{
+          font-size: 13px;
+          color: #059669;
+          font-weight: 600;
+        }}
+        .preview-card {{
+          background: #ffffff;
+          color: #1f2937;
+          border: 1px solid #d1d5db;
+          border-radius: 10px;
+          padding: 18px 20px;
+          direction: {dir_css};
+          text-align: {align_css};
+          font-family: Arial, Helvetica, sans-serif;
+          font-size: 14px;
+          line-height: 1.65;
+          max-height: {box_height - 65}px;
+          overflow-y: auto;
+          box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+        }}
+        .preview-card ol, .preview-card ul {{
+          margin: 6px 0 8px 0;
+          padding-inline-start: 24px;
+        }}
+        .preview-card li {{
+          margin-bottom: 5px;
+        }}
+        .preview-card strong {{
+          color: #111827;
+        }}
+      </style>
     </head>
     <body>
       <div class="toolbar">
-        <button class="btn btn-primary" onclick="copyRich()">📋 Copy Formatted for Groove</button>
-        <button class="btn btn-secondary" onclick="copyPlain()">📄 Copy Plain Text</button>
-        <span id="copy-status" class="status"></span>
+        <button class="btn-primary" id="copyRichBtn">📋 Copy Formatted for Groove</button>
+        <button class="btn-secondary" id="copyPlainBtn">📄 Copy Plain Text</button>
+        <span class="status" id="copyStatus"></span>
       </div>
-      <div class="paper">
-        <div id="groove-preview" dir="{dir_attr}">{groove_html}</div>
-      </div>
+      <div class="preview-card" id="previewBox">{groove_html}</div>
 
       <script>
-        const PLAIN_TEXT = {plain_json};
+        const GROOVE_HTML = {groove_html_js};
+        const PLAIN_TEXT = {plain_text_js};
+        const statusEl = document.getElementById("copyStatus");
 
         function showStatus(msg) {{
-          const el = document.getElementById("copy-status");
-          el.textContent = msg;
-          setTimeout(() => {{ el.textContent = ""; }}, 2600);
+          statusEl.textContent = msg;
+          setTimeout(() => {{ statusEl.textContent = ""; }}, 3000);
         }}
 
-        async function copyRich() {{
-          const preview = document.getElementById("groove-preview");
-          const htmlData = preview.innerHTML;
-          let success = false;
-
-          // Tier 1: Modern ClipboardItem API (writes clean text/html + text/plain)
-          if (navigator.clipboard && window.ClipboardItem) {{
-            try {{
-              const item = new ClipboardItem({{
-                "text/html": new Blob([htmlData], {{ type: "text/html" }}),
-                "text/plain": new Blob([PLAIN_TEXT], {{ type: "text/plain" }})
-              }});
-              await navigator.clipboard.write([item]);
-              success = true;
-            }} catch (e) {{
-              success = false;
+        document.getElementById("copyRichBtn").addEventListener("click", async () => {{
+          try {{
+            if (navigator.clipboard && window.ClipboardItem) {{
+              const htmlBlob = new Blob([GROOVE_HTML], {{ type: "text/html" }});
+              const textBlob = new Blob([PLAIN_TEXT], {{ type: "text/plain" }});
+              await navigator.clipboard.write([
+                new ClipboardItem({{ "text/html": htmlBlob, "text/plain": textBlob }})
+              ]);
+              showStatus("✅ Copied with Groove formatting!");
+              return;
             }}
-          }}
+          }} catch (err) {{}}
 
-          // Tier 2: DOM Selection + execCommand('copy') fallback (works reliably in iframes)
-          if (!success) {{
-            try {{
-              const range = document.createRange();
-              range.selectNodeContents(preview);
-              const sel = window.getSelection();
-              sel.removeAllRanges();
-              sel.addRange(range);
-              success = document.execCommand("copy");
-              sel.removeAllRanges();
-            }} catch (e) {{
-              success = false;
-            }}
-          }}
+          // Reliable fallback selecting the rendered white-background container
+          const range = document.createRange();
+          const box = document.getElementById("previewBox");
+          range.selectNodeContents(box);
+          const sel = window.getSelection();
+          sel.removeAllRanges();
+          sel.addRange(range);
+          document.execCommand("copy");
+          sel.removeAllRanges();
+          showStatus("✅ Copied with Groove formatting!");
+        }});
 
-          showStatus(success ? "✅ Copied with formatting! Paste directly into Groove." : "⚠️ Please press Ctrl+A then Ctrl+C inside the box.");
-        }}
-
-        async function copyPlain() {{
-          let success = false;
-          if (navigator.clipboard && navigator.clipboard.writeText) {{
-            try {{
-              await navigator.clipboard.writeText(PLAIN_TEXT);
-              success = true;
-            }} catch (e) {{
-              success = false;
-            }}
-          }}
-          if (!success) {{
+        document.getElementById("copyPlainBtn").addEventListener("click", async () => {{
+          try {{
+            await navigator.clipboard.writeText(PLAIN_TEXT);
+            showStatus("✅ Plain text copied!");
+          }} catch (err) {{
             const ta = document.createElement("textarea");
             ta.value = PLAIN_TEXT;
             document.body.appendChild(ta);
             ta.select();
-            success = document.execCommand("copy");
+            document.execCommand("copy");
             document.body.removeChild(ta);
+            showStatus("✅ Plain text copied!");
           }}
-          showStatus(success ? "✅ Plain text copied!" : "⚠️ Copy failed.");
-        }}
+        }});
       </script>
     </body>
     </html>
     """
-    components.html(component_html, height=iframe_height, scrolling=False)
+    components.html(component_html, height=box_height, scrolling=False)
 
 
-def generate_with_fallback(
-    preferred_provider: str,
-    preferred_model: str,
-    system_prompt: str,
-    user_prompt: str,
-    mode: str,
-    temperature: float = 0.25,
-    max_tokens: int = 2800,
-) -> tuple[str, str, str]:
-    """Try preferred model first, then automatically cascade through Groq -> Gemini fallback chain."""
-    chain = [(preferred_provider, preferred_model)]
-    for item in FALLBACK_CHAIN:
-        if item not in chain:
-            chain.append(item)
-
-    errors = []
-    for idx, (provider, model_id) in enumerate(chain):
-        if provider == "groq" and not GROQ_API_KEY:
-            continue
-        if provider == "gemini" and not GEMINI_API_KEY:
-            continue
-        try:
-            raw_output = call_provider(provider, model_id, system_prompt, user_prompt, temperature, max_tokens)
-            agent_note, body = extract_agent_note(raw_output)
-            clean_body = clean_for_groove(body, mode)
-            label = f"{provider}:{model_id}" if idx == 0 else f"{provider}:{model_id} (auto-fallback)"
-            return clean_body, agent_note, label
-        except Exception as e:
-            errors.append(f"{provider}:{model_id} -> {str(e)[:120]}")
-            continue
-
-    raise RuntimeError("All configured AI providers failed:\n" + "\n".join(errors))
-
-
-# ================= PASSWORD GATE (ENTER KEY + BROWSER SAVE + EYE ICON) =================
+# ================= PASSWORD GATE (ENTER SUBMIT + PASSWORD MANAGER + EYE ICON) =================
 if TEAM_PASSWORD:
     if "authenticated" not in st.session_state:
         st.session_state.authenticated = False
@@ -958,50 +537,54 @@ if TEAM_PASSWORD:
         st.markdown(
             """
             <style>
-            /* Make the built-in password eye icon crisp and clearly visible */
-            button[title="Show password text"],
-            button[title="Hide password text"],
-            [data-testid="stTextInput"] button {
-                opacity: 0.92 !important;
+            div[data-testid="stTextInput"] button[aria-label*="password"],
+            div[data-testid="stTextInput"] button[title*="password"] {
+                opacity: 1 !important;
+                color: #4b5563 !important;
             }
             </style>
             """,
             unsafe_allow_html=True,
         )
-
-        _, center_col, _ = st.columns([1, 1.4, 1])
+        _, center_col, _ = st.columns([1, 1.3, 1])
         with center_col:
             st.title("🔒 Sapaad Support AI Assistant")
-            with st.form("team_login_form", clear_on_submit=False):
+            with st.form("login_form", clear_on_submit=False):
                 st.text_input(
                     "Team Account",
-                    value="sapaad-support",
+                    value="sapaad-support-team",
                     autocomplete="username",
-                    help="Used by your browser Password Manager so it offers to save your login.",
                 )
                 pwd = st.text_input(
-                    "Team Password",
+                    "Enter Team Password",
                     type="password",
                     autocomplete="current-password",
-                    placeholder="Enter team password and press Enter...",
+                    placeholder="Type team password and press Enter...",
                 )
                 submitted = st.form_submit_button("Login", type="primary", use_container_width=True)
-
-            if submitted:
-                if pwd == TEAM_PASSWORD:
-                    st.session_state.authenticated = True
-                    st.rerun()
-                else:
-                    st.error("Incorrect password.")
+                if submitted:
+                    if pwd == TEAM_PASSWORD:
+                        st.session_state.authenticated = True
+                        st.rerun()
+                    else:
+                        st.error("Incorrect password.")
         st.stop()
 
 
 # ================= MAIN UI =================
 if not GROQ_API_KEY and not GEMINI_API_KEY:
-    st.error("Missing API keys. Add `GROQ_API_KEY` and/or `GEMINI_API_KEY` in Streamlit Cloud Settings → Secrets.")
+    st.error("Missing `GROQ_API_KEY` or `GEMINI_API_KEY` secret. Add at least one in Streamlit Cloud Settings → Secrets.")
     st.stop()
 
-bm25, docs, kb_count, ticket_count, skipped_tickets = build_search_index()
+index_bundle = load_index()
+stats = index_bundle.get("stats", {})
+
+# Filter model dropdown to only providers that have API keys configured
+available_models = {
+    label: pair
+    for label, pair in MODELS.items()
+    if (pair[0] == "groq" and GROQ_API_KEY) or (pair[0] == "gemini" and GEMINI_API_KEY)
+}
 
 with st.sidebar:
     st.title("⚙️ Sapaad Support AI")
@@ -1011,66 +594,74 @@ with st.sidebar:
         index=0,
     )
     language = st.selectbox("Output Language", ["Auto (Match Customer)", "English", "Arabic"])
-    model_label = st.selectbox("Primary AI Model", list(MODELS.keys()), index=0)
+    model_label = st.selectbox("AI Model", list(available_models.keys()), index=0)
     top_k = st.slider("Reference Sources to Pull", min_value=3, max_value=8, value=5)
 
-    verify_kb_in_refine = False
-    if mode == "Refine Draft":
-        verify_kb_in_refine = st.checkbox("Verify Sapaad steps against KB/Tickets", value=False)
-
     st.divider()
-    if docs:
-        st.success(f"Indexed **{kb_count:,}** KB chunks & **{ticket_count:,}** resolved tickets")
-        if skipped_tickets:
-            st.caption(f"Filtered out {skipped_tickets:,} unresolved/empty tickets")
+    if index_bundle.get("docs"):
+        policy_note = f" + **{stats.get('policies', 0)}** policies" if stats.get("policies") else ""
+        st.success(
+            f"Indexed **{stats.get('kb', 0):,}** KB chunks{policy_note} & "
+            f"**{stats.get('tickets', 0):,}** resolved tickets "
+            f"*(skipped {stats.get('skipped_tickets', 0):,} empty/unresolved)*"
+        )
+        if index_bundle.get("hybrid_ready") and CF_ACCOUNT_ID and CF_API_TOKEN:
+            st.caption("Search Mode: **Hybrid (Smart BM25+ & bge-m3)**")
+        else:
+            st.caption("Search Mode: **Smart BM25+ (Zero-RAM)**")
     else:
         st.warning("No `.md` files found in `./data` or `HF_DATASET_REPO`.")
 
-    active_providers = []
+    active_provs = []
     if GROQ_API_KEY:
-        active_providers.append("Groq")
+        active_provs.append("Groq")
     if GEMINI_API_KEY:
-        active_providers.append("Gemini")
-    st.caption(f"Active Providers (Auto-Fallback): **{' → '.join(active_providers)}**")
+        active_provs.append("Gemini")
+    st.caption(f"Active Providers (Auto-Fallback): **{' → '.join(active_provs)}**")
 
 st.header(f"📩 {mode}")
 
 col1, col2 = st.columns([1, 1], gap="large")
 
 with col1:
+    verify_kb_in_refine = False
     if mode == "Draft Reply":
         customer_email = st.text_area(
             "Paste Customer Email",
-            height=240,
+            height=250,
             placeholder="Paste the full customer email from Groove here...",
         )
         agent_notes = st.text_area(
             "Agent Instructions / Key Points (Optional)",
-            height=100,
-            placeholder="e.g., Do not offer a meeting / Ask for AnyDesk ID / Confirm they are on iOS...",
+            height=105,
+            placeholder="e.g., Ask if they are using Android or iOS / Tell them we tried calling and need AnyDesk ID...",
         )
     elif mode == "Refine Draft":
         agent_notes = st.text_area(
             "Your Rough Draft to Refine",
-            height=200,
+            height=210,
             placeholder="Paste your rough draft here...",
         )
         customer_email = st.text_area(
             "Customer Email (Optional context)",
-            height=140,
-            placeholder="Optional: paste the customer's email for context...",
+            height=130,
+            placeholder="Optional: paste the customer's email so the AI checks tone & context...",
+        )
+        verify_kb_in_refine = st.checkbox(
+            "Verify technical Sapaad steps against KB & Tickets",
+            value=False,
         )
     elif mode == "FAQ / Template":
         customer_email = st.text_area(
             "Topic / Scenario for Reusable Template",
-            height=200,
+            height=210,
             placeholder="e.g., How to install Cloud Print Agent and find the API key...",
         )
         agent_notes = st.text_area("Extra Requirements (Optional)", height=100)
     else:
         customer_email = st.text_area(
             "Paste Ticket Thread or Foreign-Language Email",
-            height=260,
+            height=270,
             placeholder="Paste the email or thread to summarize into an English internal note...",
         )
         agent_notes = st.text_area("Focus / Specific Question (Optional)", height=80)
@@ -1079,28 +670,44 @@ with col1:
 
 with col2:
     if generate_btn:
-        has_input = bool(customer_email.strip() or agent_notes.strip())
-        if not has_input:
+        search_source = (customer_email.strip() or agent_notes.strip()) if mode != "Refine Draft" else f"{agent_notes}\n{customer_email}".strip()
+        if not search_source:
             st.warning("Please enter an email or draft first.")
         else:
-            pref_provider, pref_model = MODELS[model_label]
-            with st.spinner("Searching Sapaad KB & Tickets (Smart BM25+) and generating..."):
-                run_search = (
-                    mode in ("Draft Reply", "FAQ / Template")
-                    or (mode == "Refine Draft" and verify_kb_in_refine)
-                )
-                search_source = customer_email.strip() or agent_notes.strip()
+            primary_provider, primary_model = available_models[model_label]
+            should_search = (
+                mode in ("Draft Reply", "FAQ / Template")
+                or (mode == "Refine Draft" and verify_kb_in_refine)
+            )
 
-                if run_search:
-                    matches, used_queries, extractor_used = retrieve_context(
-                        bm25, docs, search_source, pref_model, top_k=top_k
+            with st.spinner("Searching Sapaad KB & Tickets and generating..."):
+                if should_search:
+                    matches, search_meta = _smart_retrieve_context(
+                        index_bundle=index_bundle,
+                        query=search_source,
+                        extract_subqueries_fn=lambda txt: extract_english_subqueries(
+                            txt, primary_provider, primary_model
+                        ),
+                        top_k=top_k,
+                        cf_account_id=CF_ACCOUNT_ID,
+                        cf_api_token=CF_API_TOKEN,
                     )
                 else:
-                    matches, used_queries, extractor_used = [], [], "Skipped (Not needed for mode)"
+                    matches, search_meta = [], {}
 
-                context_block = "\n\n---\n\n".join(
-                    f"[{m['type']} | {m['source']}]\n{m['text']}" for m in matches
-                )
+                # Build strict budget-capped context block to prevent Groq 413/TPM errors
+                context_chunks = []
+                used_chars = 0
+                for m in matches:
+                    snippet = f"[{m['type']} | {m['source']}]\n{m['text']}"
+                    if used_chars + len(snippet) > MAX_CONTEXT_CHARS:
+                        remaining = MAX_CONTEXT_CHARS - used_chars
+                        if remaining > 350:
+                            context_chunks.append(snippet[:remaining] + "...")
+                        break
+                    context_chunks.append(snippet)
+                    used_chars += len(snippet) + 8
+                context_block = "\n\n---\n\n".join(context_chunks)
 
                 lang_rule = (
                     "Match the customer's language (English or Arabic)."
@@ -1108,26 +715,28 @@ with col2:
                     else f"Write the output in {language}."
                 )
 
-                active_sys_prompt = SYSTEM_PROMPT
-                temp = 0.25
+                active_system_prompt = SYSTEM_PROMPT
+                temp = 0.22
 
                 if mode == "Draft Reply":
                     prompt = (
                         f"TASK: Draft a ready-to-send Sapaad Support email reply.\n"
                         f"LANGUAGE: {lang_rule}\n\n"
                         f"CUSTOMER EMAIL:\n{customer_email}\n\n"
-                        f"AGENT INSTRUCTIONS (obey strictly and naturally):\n{agent_notes or 'None'}\n\n"
-                        f"REFERENCE CONTEXT (Sapaad KB & Past Tickets):\n{context_block or 'No matching context found.'}"
+                        f"AGENT INSTRUCTIONS (follow strictly if provided, without exposing harsh internal phrasing):\n"
+                        f"{agent_notes or 'None'}\n\n"
+                        f"REFERENCE CONTEXT (Sapaad Policies, KB & Past Tickets):\n"
+                        f"{context_block or 'No matching context found.'}"
                     )
                 elif mode == "Refine Draft":
-                    active_sys_prompt = REFINE_SYSTEM_PROMPT
+                    active_system_prompt = REFINE_SYSTEM_PROMPT
                     temp = 0.35
                     prompt = (
-                        f"TASK: Polish and elevate the agent's rough draft below into a clear, warm, professional Sapaad Support email.\n"
+                        f"TASK: Refine and polish the agent's rough draft below.\n"
                         f"LANGUAGE: {lang_rule}\n\n"
                         f"AGENT ROUGH DRAFT:\n{agent_notes}\n\n"
                         f"CUSTOMER EMAIL (Optional context):\n{customer_email or 'Not provided'}\n\n"
-                        f"REFERENCE CONTEXT (for verifying Sapaad terms/steps only):\n{context_block or 'None'}"
+                        f"REFERENCE CONTEXT:\n{context_block or 'None'}"
                     )
                 elif mode == "FAQ / Template":
                     prompt = (
@@ -1139,40 +748,55 @@ with col2:
                     )
                 else:
                     prompt = (
-                        f"TASK: Write a concise English internal Groove note summarizing this ticket for teammates (translate if needed). Do NOT include a customer greeting or customer closing line.\n\n"
+                        f"TASK: Write a concise English internal Groove note summarizing this ticket for teammates (translate if needed). "
+                        f"Do NOT include a customer greeting or customer closing line.\n\n"
                         f"TICKET CONTENT:\n{customer_email}\n"
                         f"FOCUS:\n{agent_notes or 'Key issue, account details, and next action needed.'}"
                     )
 
                 try:
-                    output, agent_note, used_model = generate_with_fallback(
-                        pref_provider, pref_model, active_sys_prompt, prompt, mode, temperature=temp
+                    raw_output, used_model = call_llm(
+                        primary_provider=primary_provider,
+                        primary_model=primary_model,
+                        system_prompt=active_system_prompt,
+                        user_prompt=prompt,
+                        temperature=temp,
+                        max_tokens=3000,
                     )
-                    st.session_state.last_output = output
+                    agent_note, clean_draft = split_agent_note_and_clean(
+                        raw_output, mode, language, customer_email
+                    )
+                    st.session_state.last_output = clean_draft
                     st.session_state.last_agent_note = agent_note
                     st.session_state.last_model = used_model
                     st.session_state.last_matches = matches
-                    st.session_state.last_queries = used_queries
-                    st.session_state.last_extractor = extractor_used
+                    st.session_state.last_search_meta = search_meta
                 except Exception as e:
                     st.error(f"API Error: {e}")
 
     if "last_output" in st.session_state:
-        if st.session_state.get("last_agent_note"):
-            st.warning(f"📝 **Agent Note (Not included in copy box):**\n\n{st.session_state.last_agent_note}")
+        st.subheader("Ready for Groove")
 
-        st.subheader("Ready to Copy")
-        render_groove_copy_box(st.session_state.last_output)
-        st.caption(
-            f"Model used: `{st.session_state.last_model}` | "
-            f"Query engine: `{st.session_state.get('last_extractor', 'N/A')}`"
-        )
+        if st.session_state.get("last_agent_note"):
+            st.warning(f"**Internal Agent Note (not copied into email):** {st.session_state.last_agent_note}")
+
+        render_groove_preview_and_copy(st.session_state.last_output)
+
+        meta = st.session_state.get("last_search_meta", {})
+        engine_caption = f" | Search: `{meta.get('engine')}` | Grounding: `{meta.get('confidence')}`" if meta else ""
+        st.caption(f"Model used: `{st.session_state.last_model}`{engine_caption}")
 
         if st.session_state.get("last_matches"):
             with st.expander(f"📚 Referenced Sources ({len(st.session_state.last_matches)})"):
-                if st.session_state.get("last_queries"):
-                    st.info("Search queries used: " + " | ".join(st.session_state.last_queries))
+                if meta:
+                    st.info(
+                        f"**Engine:** {meta.get('engine')} | "
+                        f"**Grounding Confidence:** {meta.get('confidence')} "
+                        f"(BM25: {meta.get('top_bm25', 0)}, Cosine: {meta.get('top_cosine', 0)})\n\n"
+                        f"**Queries:** {' | '.join(meta.get('queries', []))}"
+                    )
                 for m in st.session_state.last_matches:
-                    st.markdown(f"**[{m['type']}] {m['title']}** *({m['source']} | weight: {m['weight']:.2f})*")
-                    st.caption(m["text"][:450] + "...")
+                    matched_tag = f" — *matched: {m['matched_query']}*" if m.get("matched_query") else ""
+                    st.markdown(f"**[{m['type']}] {m['title']}** *({m['source']})*{matched_tag}")
+                    st.caption(m["text"][:450] + ("..." if len(m["text"]) > 450 else ""))
                     st.divider()
