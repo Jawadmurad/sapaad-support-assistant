@@ -491,5 +491,6 @@ def retrieve_context(
         "confidence": confidence,
         "top_bm25": round(top_raw_bm25, 2),
         "top_cosine": round(top_cosine, 3),
+        "cf_error": cf_error,
     }
     return results, debug_info
