@@ -7,7 +7,7 @@ import urllib.request
 GROOVE_GQL_URL = "https://api.groovehq.com/v2/graphql"
 GROOVE_REST_URL = "https://api.groovehq.com/v1"
 
-# Verified Groove GraphQL v2 query capturing both EmailMessage.body and Reply.summary.body
+# Verified Groove GraphQL v2 query pulling full untruncated message body + parts
 THREAD_QUERY = """
 query TicketConversationQuery($eventGroupsFilter: EventGroupsFilterInput!, $last: Int, $before: String) {
   eventGroups(filter: $eventGroupsFilter, last: $last, before: $before) {
@@ -36,11 +36,28 @@ query TicketConversationQuery($eventGroupsFilter: EventGroupsFilterInput!, $last
                   body
                   isNote
                   createdAt
+                  parts {
+                    edges {
+                      node {
+                        content
+                        type
+                      }
+                    }
+                  }
                 }
                 ... on Reply {
                   id
+                  body
                   isNote
                   createdAt
+                  parts {
+                    edges {
+                      node {
+                        content
+                        type
+                      }
+                    }
+                  }
                   summary {
                     body
                     bodyPlainText
@@ -70,6 +87,19 @@ query TicketMeta($id: ID!) {
   }
 }
 """
+
+
+def _extract_parts_html(parts_obj: dict) -> str:
+    """Combine all untruncated text/html parts from a Groove message."""
+    if not isinstance(parts_obj, dict):
+        return ""
+    chunks = []
+    for edge in parts_obj.get("edges") or []:
+        node = edge.get("node") or {}
+        content = (node.get("content") or "").strip()
+        if content:
+            chunks.append(content)
+    return "\n".join(chunks).strip()
 
 
 def clean_email_html(body_html: str) -> str:
@@ -196,8 +226,12 @@ def _fetch_via_graphql(ticket_num: str, bearer_token: str) -> dict:
                     role = "note" if is_note else ("agent" if ctype == "Reply" else "customer")
 
                     chg_summary = change.get("summary") or {}
+                    parts_html = _extract_parts_html(change.get("parts") or {})
+
+                    # Prefer full untruncated `body` or `parts` before falling back to `summary`
                     raw_html = (
                         change.get("body")
+                        or parts_html
                         or chg_summary.get("body")
                         or chg_summary.get("bodyPlainText")
                         or grp_summary.get("body")
@@ -213,7 +247,6 @@ def _fetch_via_graphql(ticket_num: str, bearer_token: str) -> dict:
                             "text": body_clean,
                         })
 
-            # Fallback if Groove returned the message directly on eventGroup.summary
             if not found_in_events and (grp_summary.get("body") or grp_summary.get("bodyPlainText")):
                 role = "note" if is_group_note else ("agent" if author_type == "Agent" else "customer")
                 body_clean = clean_email_html(grp_summary.get("body") or grp_summary.get("bodyPlainText") or "")
