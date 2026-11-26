@@ -50,14 +50,6 @@ query TicketConversationQuery($eventGroupsFilter: EventGroupsFilterInput!, $last
                   body
                   isNote
                   createdAt
-                  parts {
-                    edges {
-                      node {
-                        content
-                        type
-                      }
-                    }
-                  }
                   summary {
                     body
                     bodyPlainText
