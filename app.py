@@ -885,14 +885,13 @@ with st.sidebar:
             st.success("Groove GraphQL Bearer Token active.")
         else:
             st.info("Click your **✨ Sapaad AI** bookmark while on Groove to connect automatically.")
-        runtime_tok = st.text_input(
-             "Manual Session Bearer Token (Optional)",
-             key="groove_runtime_bearer",
-             type="password",
-             placeholder="Auto-filled by bookmarklet...",
-             help="Filled automatically by the Groove bookmarklet, or paste manually if needed.",
-         )
-        st.session_state.groove_runtime_bearer = runtime_tok
+        st.text_input(
+            "Manual Session Bearer Token (Optional)",
+            key="groove_runtime_bearer",
+            type="password",
+            placeholder="Auto-filled by bookmarklet...",
+            help="Filled automatically by the Groove bookmarklet, or paste manually if needed.",
+        )
 
     if index_bundle.get("docs"):
         policy_note = f" + **{stats.get('policies', 0)}** policies" if stats.get("policies") else ""
@@ -1385,4 +1384,3 @@ with col2:
                     st.markdown(f"**[{m['type']}] {m['title']}** *({m['source']})*{matched_tag}")
                     st.caption(m["text"][:450] + ("..." if len(m["text"]) > 450 else ""))
                     st.divider()
-
