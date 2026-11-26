@@ -933,15 +933,15 @@ with col1:
 
     # -------- GROOVE TICKET FETCHER BAR (Draft Reply & Internal Note) --------
     if mode in ("Draft Reply", "Internal Note / Summary"):
-        g1, g2, g3 = st.columns([2.2, 1.1, 0.7], gap="small")
+        g1, g2, g3 = st.columns([1.8, 1.15, 1.0], gap="small")
         ticket_num_input = g1.text_input(
             "Groove Ticket #",
-            placeholder="Enter Groove Ticket # (e.g., 114201)",
+            placeholder="Ticket # (e.g., 114201)",
             label_visibility="collapsed",
         )
-        fetch_clicked = g2.button("📥 Fetch Ticket", use_container_width=True)
+        fetch_clicked = g2.button("📥 Fetch", use_container_width=True, help="Fetch full ticket thread from Groove")
         clear_clicked = g3.button("🧹 Clear", use_container_width=True, help="Clear loaded ticket fields")
-
+        
         if clear_clicked:
             st.session_state.customer_email_box = ""
             st.session_state.prev_replies_box = ""
@@ -1384,3 +1384,4 @@ with col2:
                     st.markdown(f"**[{m['type']}] {m['title']}** *({m['source']})*{matched_tag}")
                     st.caption(m["text"][:450] + ("..." if len(m["text"]) > 450 else ""))
                     st.divider()
+
