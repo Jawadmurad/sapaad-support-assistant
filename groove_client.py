@@ -7,7 +7,7 @@ import urllib.request
 GROOVE_GQL_URL = "https://api.groovehq.com/v2/graphql"
 GROOVE_REST_URL = "https://api.groovehq.com/v1"
 
-# Verified Groove GraphQL v2 query pulling full untruncated message body + parts
+# Verified Groove GraphQL v2 query capturing full EmailMessage, Reply, and summary.bodyPlainText
 THREAD_QUERY = """
 query TicketConversationQuery($eventGroupsFilter: EventGroupsFilterInput!, $last: Int, $before: String) {
   eventGroups(filter: $eventGroupsFilter, last: $last, before: $before) {
@@ -36,24 +36,12 @@ query TicketConversationQuery($eventGroupsFilter: EventGroupsFilterInput!, $last
                   body
                   isNote
                   createdAt
-                  parts {
-                    edges {
-                      node {
-                        content
-                        type
-                      }
-                    }
-                  }
                 }
                 ... on Reply {
                   id
                   body
                   isNote
                   createdAt
-                  summary {
-                    body
-                    bodyPlainText
-                  }
                 }
               }
             }
@@ -81,21 +69,27 @@ query TicketMeta($id: ID!) {
 """
 
 
-def _extract_parts_html(parts_obj: dict) -> str:
-    """Combine all untruncated text/html parts from a Groove message."""
-    if not isinstance(parts_obj, dict):
-        return ""
-    chunks = []
-    for edge in parts_obj.get("edges") or []:
-        node = edge.get("node") or {}
-        content = (node.get("content") or "").strip()
-        if content:
-            chunks.append(content)
-    return "\n".join(chunks).strip()
+def _strip_quoted_history(text: str) -> str:
+    """Remove repeated quoted email reply chains below standard dividers."""
+    cut_patterns = [
+        r"(?im)^\s*On\s+.+?wrote:\s*$",
+        r"(?im)^\s*-{3,}\s*Original Message\s*-{3,}",
+        r"(?im)^\s*From:\s+.+\n\s*Sent:\s+",
+        r"(?im)^\s*_{10,}\s*$",
+    ]
+    for pat in cut_patterns:
+        m = re.search(pat, text)
+        if m and m.start() > 25:
+            text = text[: m.start()]
+
+    text = re.sub(r"\r\n?", "\n", text)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 def clean_email_html(body_html: str) -> str:
-    """Convert Groove HTML email body into clean plain text and strip repeated quoted reply chains."""
+    """Convert Groove HTML email body into clean plain text."""
     if not body_html:
         return ""
     try:
@@ -115,21 +109,22 @@ def clean_email_html(body_html: str) -> str:
         text = re.sub(r"<[^>]+>", " ", text)
         text = html.unescape(text)
 
-    cut_patterns = [
-        r"(?im)^\s*On\s+.+?wrote:\s*$",
-        r"(?im)^\s*-{3,}\s*Original Message\s*-{3,}",
-        r"(?im)^\s*From:\s+.+\n\s*Sent:\s+",
-        r"(?im)^\s*_{10,}\s*$",
-    ]
-    for pat in cut_patterns:
-        m = re.search(pat, text)
-        if m and m.start() > 25:
-            text = text[: m.start()]
+    return _strip_quoted_history(text)
 
-    text = re.sub(r"\r\n?", "\n", text)
-    text = re.sub(r"[ \t]+\n", "\n", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
+
+def _pick_best_body(*candidates: tuple[str, bool]) -> str:
+    """
+    Evaluate (text, is_html) candidates and return the longest, most complete cleaned message.
+    Prevents truncated summary.body HTML from overriding complete summary.bodyPlainText.
+    """
+    best = ""
+    for raw, is_html in candidates:
+        if not raw:
+            continue
+        cleaned = clean_email_html(raw) if is_html else _strip_quoted_history(html.unescape(raw))
+        if len(cleaned) > len(best):
+            best = cleaned
+    return best
 
 
 def _gql_post(token: str, query_name: str, payload: dict) -> dict:
@@ -217,20 +212,11 @@ def _fetch_via_graphql(ticket_num: str, bearer_token: str) -> dict:
                     is_note = is_group_note or bool(change.get("isNote"))
                     role = "note" if is_note else ("agent" if ctype == "Reply" else "customer")
 
-                    chg_summary = change.get("summary") or {}
-                    parts_html = _extract_parts_html(change.get("parts") or {})
-
-                    # Prefer full untruncated `body` or `parts` before falling back to `summary`
-                    raw_html = (
-                        change.get("body")
-                        or parts_html
-                        or chg_summary.get("body")
-                        or chg_summary.get("bodyPlainText")
-                        or grp_summary.get("body")
-                        or grp_summary.get("bodyPlainText")
-                        or ""
+                    body_clean = _pick_best_body(
+                        (change.get("body") or "", True),
+                        (grp_summary.get("body") or "", True),
+                        (grp_summary.get("bodyPlainText") or "", False),
                     )
-                    body_clean = clean_email_html(raw_html)
                     if body_clean:
                         batch.append({
                             "role": role,
@@ -241,7 +227,10 @@ def _fetch_via_graphql(ticket_num: str, bearer_token: str) -> dict:
 
             if not found_in_events and (grp_summary.get("body") or grp_summary.get("bodyPlainText")):
                 role = "note" if is_group_note else ("agent" if author_type == "Agent" else "customer")
-                body_clean = clean_email_html(grp_summary.get("body") or grp_summary.get("bodyPlainText") or "")
+                body_clean = _pick_best_body(
+                    (grp_summary.get("bodyPlainText") or "", False),
+                    (grp_summary.get("body") or "", True),
+                )
                 if body_clean:
                     batch.append({
                         "role": role,
@@ -297,7 +286,10 @@ def _fetch_via_rest_v1(ticket_num: str, api_token: str) -> dict:
         is_note = bool(m.get("note"))
         author_href = ((m.get("links") or {}).get("author") or {}).get("href") or ""
         role = "note" if is_note else ("agent" if "/agents/" in author_href else "customer")
-        body_clean = clean_email_html(m.get("body") or m.get("plain_text_body") or "")
+        body_clean = _pick_best_body(
+            (m.get("body") or "", True),
+            (m.get("plain_text_body") or "", False),
+        )
         if body_clean:
             messages.append({
                 "role": role,
