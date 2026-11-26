@@ -20,35 +20,214 @@ from verifier import verify_and_repair_draft
 
 # ================= CONFIGURATION =================
 st.set_page_config(
-    page_title="Sapaad Support AI Assistant",
+    page_title="Sapaad Support AI",
     page_icon="📩",
     layout="wide",
+    initial_sidebar_state="expanded",
 )
 
+# ================= CLEAN MODERN SAAS STYLING =================
 st.markdown(
     """
     <style>
+    /* Tighter, balanced page canvas */
     .block-container {
-        padding-top: 1.5rem;
-        padding-bottom: 2rem;
+        padding-top: 1.25rem;
+        padding-bottom: 1.75rem;
+        max-width: 1440px;
     }
+
+    /* Sidebar polish */
+    section[data-testid="stSidebar"] {
+        background-color: #f8fafc;
+        border-right: 1px solid #e2e8f0;
+    }
+    section[data-testid="stSidebar"] .block-container {
+        padding-top: 1.2rem;
+    }
+    .brand-title {
+        font-size: 1.15rem;
+        font-weight: 700;
+        color: #0f172a;
+        margin: 0;
+        letter-spacing: -0.01em;
+    }
+    .brand-sub {
+        font-size: 0.78rem;
+        color: #64748b;
+        margin: 0.1rem 0 0.85rem 0;
+    }
+
+    /* Sidebar nav radio styled as clean pills */
+    section[data-testid="stSidebar"] div[role="radiogroup"] {
+        gap: 4px;
+    }
+    section[data-testid="stSidebar"] div[role="radiogroup"] label {
+        padding: 0.42rem 0.65rem;
+        border-radius: 8px;
+        transition: background 0.15s ease;
+        margin-bottom: 0;
+    }
+    section[data-testid="stSidebar"] div[role="radiogroup"] label:hover {
+        background: #eef2f7;
+    }
+
+    /* Compact system status card in sidebar */
+    .sys-status-card {
+        background: #ffffff;
+        border: 1px solid #e2e8f0;
+        border-radius: 10px;
+        padding: 0.65rem 0.8rem;
+        font-size: 0.76rem;
+        color: #475569;
+        line-height: 1.55;
+        margin-top: 0.75rem;
+    }
+    .sys-status-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 6px;
+    }
+    .dot-green {
+        display: inline-block;
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: #10b981;
+        margin-right: 5px;
+    }
+
+    /* Workspace top title & inline badges */
+    .workspace-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 0.65rem;
+        flex-wrap: wrap;
+    }
+    .workspace-title {
+        font-size: 1.35rem;
+        font-weight: 700;
+        color: #0f172a;
+        margin: 0;
+        letter-spacing: -0.015em;
+    }
+    .panel-header-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        margin-bottom: 0.55rem;
+        flex-wrap: wrap;
+    }
+    .panel-title {
+        font-size: 1.02rem;
+        font-weight: 650;
+        color: #0f172a;
+        margin: 0;
+    }
+
+    /* Subtle status pills */
+    .pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        padding: 3px 10px;
+        border-radius: 999px;
+        font-size: 0.76rem;
+        font-weight: 600;
+        line-height: 1.4;
+    }
+    .pill-green {
+        background: #ecfdf5;
+        color: #047857;
+        border: 1px solid #a7f3d0;
+    }
+    .pill-blue {
+        background: #eff6ff;
+        color: #1d4ed8;
+        border: 1px solid #bfdbfe;
+    }
+    .pill-slate {
+        background: #f1f5f9;
+        color: #475569;
+        border: 1px solid #cbd5e1;
+    }
+    .pill-row {
+        display: flex;
+        gap: 6px;
+        flex-wrap: wrap;
+        margin: 0.25rem 0 0.55rem 0;
+    }
+
+    /* Compact Agent Note callout */
+    .agent-note-box {
+        background: #fffbeb;
+        border: 1px solid #fde68a;
+        border-left: 3.5px solid #f59e0b;
+        border-radius: 8px;
+        padding: 0.65rem 0.85rem;
+        font-size: 0.84rem;
+        color: #78350f;
+        line-height: 1.5;
+        margin-bottom: 0.65rem;
+    }
+
+    /* Clean empty state for right panel */
+    .empty-state {
+        background: #f8fafc;
+        border: 1px dashed #cbd5e1;
+        border-radius: 12px;
+        padding: 3rem 1.75rem;
+        text-align: center;
+        color: #64748b;
+        margin-top: 0.5rem;
+    }
+    .empty-state h4 {
+        color: #1e293b;
+        font-size: 1rem;
+        font-weight: 600;
+        margin: 0.5rem 0 0.35rem 0;
+    }
+    .empty-state p {
+        font-size: 0.85rem;
+        margin: 0 auto;
+        max-width: 360px;
+        line-height: 1.55;
+    }
+
+    /* Buttons & Quick Actions */
     div[data-testid="stButton"] > button {
         border-radius: 8px;
         font-weight: 500;
-        padding: 0.42rem 0.65rem;
+        padding: 0.38rem 0.55rem;
         transition: all 0.15s ease;
     }
     div[data-testid="stButton"] > button p {
-        font-size: 0.88rem;
+        font-size: 0.82rem;
         white-space: nowrap;
     }
     .quick-actions-label {
-        font-size: 0.8rem;
+        font-size: 0.72rem;
         font-weight: 600;
         text-transform: uppercase;
-        letter-spacing: 0.04em;
-        opacity: 0.72;
-        margin: 0.35rem 0 0.4rem 0;
+        letter-spacing: 0.05em;
+        color: #64748b;
+        margin: 0.2rem 0 0.35rem 0;
+    }
+
+    /* Clean tabs spacing */
+    button[data-baseweb="tab"] {
+        font-size: 0.86rem;
+        font-weight: 500;
+        padding-top: 0.35rem;
+        padding-bottom: 0.35rem;
+    }
+    div[data-testid="stTextArea"] textarea {
+        border-radius: 8px;
+        font-size: 0.88rem;
     }
     </style>
     """,
@@ -552,8 +731,8 @@ def render_groove_preview_and_copy(draft_text: str):
 
     dir_css = "rtl" if is_rtl else "ltr"
     align_css = "right" if is_rtl else "left"
-    line_count = max(10, draft_text.count("\n") + len(draft_text) // 75)
-    box_height = min(560, max(260, line_count * 24 + 92))
+    line_count = max(9, draft_text.count("\n") + len(draft_text) // 78)
+    box_height = min(520, max(250, line_count * 24 + 86))
 
     component_html = f"""
     <!DOCTYPE html>
@@ -564,78 +743,86 @@ def render_groove_preview_and_copy(draft_text: str):
         * {{ box-sizing: border-box; }}
         body {{
           margin: 0;
-          padding: 2px;
+          padding: 0;
           font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
           background: transparent;
+        }}
+        .card-shell {{
+          background: #ffffff;
+          border: 1px solid #e2e8f0;
+          border-radius: 12px;
+          overflow: hidden;
+          box-shadow: 0 1px 4px rgba(15, 23, 42, 0.05);
         }}
         .toolbar {{
           display: flex;
           gap: 8px;
           align-items: center;
-          margin-bottom: 10px;
+          padding: 9px 14px;
+          background: #f8fafc;
+          border-bottom: 1px solid #e2e8f0;
           flex-wrap: wrap;
         }}
         .btn-primary {{
-          background: #ff4b4b;
+          background: #ef4444;
           color: #ffffff;
           border: none;
-          border-radius: 8px;
-          padding: 9px 16px;
-          font-size: 13.5px;
+          border-radius: 7px;
+          padding: 7px 13px;
+          font-size: 13px;
           font-weight: 600;
           cursor: pointer;
           transition: background 0.15s ease, transform 0.1s ease;
         }}
-        .btn-primary:hover {{ background: #e03e3e; }}
+        .btn-primary:hover {{ background: #dc2626; }}
         .btn-primary:active {{ transform: scale(0.98); }}
         .btn-secondary {{
-          background: #f3f4f6;
-          color: #1f2937;
-          border: 1px solid #d1d5db;
-          border-radius: 8px;
-          padding: 8.5px 14px;
-          font-size: 13px;
+          background: #ffffff;
+          color: #334155;
+          border: 1px solid #cbd5e1;
+          border-radius: 7px;
+          padding: 6.5px 12px;
+          font-size: 12.5px;
           font-weight: 500;
           cursor: pointer;
           transition: background 0.15s ease;
         }}
-        .btn-secondary:hover {{ background: #e5e7eb; }}
+        .btn-secondary:hover {{ background: #f1f5f9; }}
         .status {{
-          font-size: 13px;
-          color: #10b981;
+          font-size: 12.5px;
+          color: #059669;
           font-weight: 600;
+          margin-left: auto;
         }}
-        .preview-card {{
-          background: #ffffff;
+        .preview-body {{
+          padding: 18px 22px;
           color: #1f2937;
-          border: 1px solid #d1d5db;
-          border-radius: 12px;
-          padding: 20px 22px;
           direction: {dir_css};
           text-align: {align_css};
           font-family: Arial, Helvetica, sans-serif;
           font-size: 14px;
-          line-height: 1.7;
-          max-height: {box_height - 65}px;
+          line-height: 1.72;
+          max-height: {box_height - 54}px;
           overflow-y: auto;
-          box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
         }}
-        .preview-card::-webkit-scrollbar {{ width: 7px; }}
-        .preview-card::-webkit-scrollbar-track {{ background: transparent; }}
-        .preview-card::-webkit-scrollbar-thumb {{ background: #cbd5e1; border-radius: 999px; }}
-        .preview-card::-webkit-scrollbar-thumb:hover {{ background: #94a3b8; }}
-        .preview-card ol, .preview-card ul {{ margin: 6px 0 10px 0; padding-inline-start: 24px; }}
-        .preview-card li {{ margin-bottom: 6px; }}
-        .preview-card strong {{ color: #111827; }}
+        .preview-body::-webkit-scrollbar {{ width: 6px; }}
+        .preview-body::-webkit-scrollbar-track {{ background: transparent; }}
+        .preview-body::-webkit-scrollbar-thumb {{ background: #cbd5e1; border-radius: 999px; }}
+        .preview-body::-webkit-scrollbar-thumb:hover {{ background: #94a3b8; }}
+        .preview-body ol, .preview-body ul {{ margin: 6px 0 10px 0; padding-inline-start: 24px; }}
+        .preview-body li {{ margin-bottom: 5px; }}
+        .preview-body strong {{ color: #0f172a; }}
       </style>
     </head>
     <body>
-      <div class="toolbar">
-        <button class="btn-primary" id="copyRichBtn">📋 Copy Formatted for Groove</button>
-        <button class="btn-secondary" id="copyPlainBtn">📄 Copy Plain Text</button>
-        <span class="status" id="copyStatus"></span>
+      <div class="card-shell">
+        <div class="toolbar">
+          <button class="btn-primary" id="copyRichBtn">📋 Copy for Groove</button>
+          <button class="btn-secondary" id="copyPlainBtn">📄 Plain Text</button>
+          <span class="status" id="copyStatus"></span>
+        </div>
+        <div class="preview-body" id="previewBox">{groove_html}</div>
       </div>
-      <div class="preview-card" id="previewBox">{groove_html}</div>
 
       <script>
         const GROOVE_HTML = {groove_html_js};
@@ -655,7 +842,7 @@ def render_groove_preview_and_copy(draft_text: str):
               await navigator.clipboard.write([
                 new ClipboardItem({{ "text/html": htmlBlob, "text/plain": textBlob }})
               ]);
-              showStatus("✅ Copied with Groove formatting!");
+              showStatus("✅ Copied!");
               return;
             }}
           }} catch (err) {{}}
@@ -668,7 +855,7 @@ def render_groove_preview_and_copy(draft_text: str):
           sel.addRange(range);
           document.execCommand("copy");
           sel.removeAllRanges();
-          showStatus("✅ Copied with Groove formatting!");
+          showStatus("✅ Copied!");
         }});
 
         document.getElementById("copyPlainBtn").addEventListener("click", async () => {{
@@ -799,9 +986,9 @@ if TEAM_PASSWORD:
             """,
             unsafe_allow_html=True,
         )
-        _, center_col, _ = st.columns([1, 1.3, 1])
+        _, center_col, _ = st.columns([1, 1.2, 1])
         with center_col:
-            st.title("🔒 Sapaad Support AI Assistant")
+            st.markdown("### 🔒 Sapaad Support AI")
             if st.session_state.get("pending_groove_ticket"):
                 st.info(
                     f"🔗 Groove Ticket **#{st.session_state.pending_groove_ticket}** queued — "
@@ -810,10 +997,10 @@ if TEAM_PASSWORD:
             with st.form("login_form", clear_on_submit=False):
                 st.text_input("Team Account", value="sapaad-support-team", autocomplete="username")
                 pwd = st.text_input(
-                    "Enter Team Password",
+                    "Team Password",
                     type="password",
                     autocomplete="current-password",
-                    placeholder="Type team password and press Enter...",
+                    placeholder="Enter team password...",
                 )
                 submitted = st.form_submit_button("Login", type="primary", use_container_width=True)
                 if submitted:
@@ -850,11 +1037,16 @@ available_models = {
     or (pair[0] == "openrouter" and OPENROUTER_API_KEY)
 }
 
-# ================= SIDEBAR =================
+# ================= CLEAN, MINIMAL SIDEBAR =================
 with st.sidebar:
-    st.title("⚙️ Sapaad Support AI")
+    st.markdown(
+        '<p class="brand-title">⚙️ Sapaad Support AI</p>'
+        '<p class="brand-sub">Groove Reply & Knowledge Copilot</p>',
+        unsafe_allow_html=True,
+    )
+
     mode = st.radio(
-        "Mode",
+        "Workspace",
         [
             "Draft Reply",
             "🌍 Arabic Translator",
@@ -863,64 +1055,98 @@ with st.sidebar:
             "Internal Note / Summary",
         ],
         index=0,
+        label_visibility="collapsed",
     )
+
+    st.markdown("<div style='height:0.35rem'></div>", unsafe_allow_html=True)
     language = (
         "Arabic"
         if mode == "🌍 Arabic Translator"
         else st.selectbox("Output Language", ["Auto (Match Customer)", "English", "Arabic"])
     )
-    model_label = st.selectbox("AI Model", list(available_models.keys()), index=0)
-    if mode in ("Draft Reply", "Refine Draft", "FAQ / Template"):
-        top_k = st.slider("Reference Sources to Pull", min_value=3, max_value=8, value=5)
-    else:
-        top_k = 5
 
-    st.divider()
-    with st.expander("🔗 Groove Connection (Ticket Fetch)"):
-        if GROOVE_API_TOKEN:
-            st.success("Groove REST API Token active (permanent).")
-        elif st.session_state.groove_runtime_bearer:
-            st.success("Connected via Groove 1-Click Bookmarklet.")
-        elif GROOVE_BEARER_TOKEN:
-            st.success("Groove GraphQL Bearer Token active.")
+    # Secondary settings neatly tucked inside one expander
+    groove_connected = bool(
+        GROOVE_API_TOKEN or st.session_state.groove_runtime_bearer or GROOVE_BEARER_TOKEN
+    )
+    with st.expander("⚙️ Model, Search & Groove", expanded=False):
+        model_label = st.selectbox("AI Model", list(available_models.keys()), index=0)
+        if mode in ("Draft Reply", "Refine Draft", "FAQ / Template"):
+            top_k = st.slider("Reference Sources", min_value=3, max_value=8, value=5)
         else:
-            st.info("Click your **✨ Sapaad AI** bookmark while on Groove to connect automatically.")
+            top_k = 5
+
+        st.divider()
+        st.caption("**Groove Connection**")
+        if GROOVE_API_TOKEN:
+            st.success("REST API Token active.", icon="✅")
+        elif st.session_state.groove_runtime_bearer:
+            st.success("Connected via 1-Click Bookmarklet.", icon="✅")
+        elif GROOVE_BEARER_TOKEN:
+            st.success("GraphQL Bearer Token active.", icon="✅")
+        else:
+            st.caption("Click your **✨ Sapaad AI** bookmark on Groove to connect.")
+
         st.text_input(
-            "Manual Session Bearer Token (Optional)",
+            "Manual Session Bearer Token",
             key="groove_runtime_bearer",
             type="password",
             placeholder="Auto-filled by bookmarklet...",
-            help="Filled automatically by the Groove bookmarklet, or paste manually if needed.",
+            help="Filled automatically by the Groove bookmarklet, or paste manually.",
         )
 
+    # Compact status footer card
+    active_provs = [
+        p
+        for p, k in [("Groq", GROQ_API_KEY), ("Gemini", GEMINI_API_KEY), ("OpenRouter", OPENROUTER_API_KEY)]
+        if k
+    ]
+    is_hybrid = bool(index_bundle.get("hybrid_ready") and CF_ACCOUNT_ID and CF_API_TOKEN)
+    search_label = "Hybrid (BM25+ & bge-m3)" if is_hybrid else "Smart BM25+"
+    groove_badge = "Groove ON" if groove_connected else "Groove Off"
+
     if index_bundle.get("docs"):
-        policy_note = f" + **{stats.get('policies', 0)}** policies" if stats.get("policies") else ""
-        st.success(
-            f"Indexed **{stats.get('kb', 0):,}** KB chunks{policy_note} & "
-            f"**{stats.get('tickets', 0):,}** resolved tickets "
-            f"*(skipped {stats.get('skipped_tickets', 0):,} empty/unresolved)*"
+        kb_n = stats.get("kb", 0)
+        tkt_n = stats.get("tickets", 0)
+        pol_n = stats.get("policies", 0)
+        pol_txt = f" • {pol_n} Policies" if pol_n else ""
+        st.markdown(
+            f"""
+            <div class="sys-status-card">
+                <div class="sys-status-row">
+                    <span><span class="dot-green"></span><strong>{search_label}</strong></span>
+                    <span>🔒 PII ON</span>
+                </div>
+                <div style="margin-top:4px; color:#64748b;">
+                    {kb_n:,} KB{pol_txt} • {tkt_n:,} Tickets<br/>
+                    {' → '.join(active_provs)} • {groove_badge}
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
-        if index_bundle.get("hybrid_ready") and CF_ACCOUNT_ID and CF_API_TOKEN:
-            st.caption("Search Mode: **Hybrid (Smart BM25+ & bge-m3)**")
-        else:
-            st.caption("Search Mode: **Smart BM25+ (Zero-RAM)**")
     else:
         st.warning("No `.md` files found in `./data` or `HF_DATASET_REPO`.")
 
-    active_provs = []
-    if GROQ_API_KEY:
-        active_provs.append("Groq")
-    if GEMINI_API_KEY:
-        active_provs.append("Gemini")
-    if OPENROUTER_API_KEY:
-        active_provs.append("OpenRouter")
-    st.caption(f"Active Providers: **{' → '.join(active_provs)}**")
-    st.caption("Privacy Shield: **Client-Side PII Scrubber ON**")
-
+# ================= WORKSPACE HEADER =================
 header_icon = "" if mode.startswith("🌍") else "📩 "
-st.header(f"{header_icon}{mode}")
+ticket_pill_html = ""
+if st.session_state.loaded_ticket_banner and mode in ("Draft Reply", "Internal Note / Summary"):
+    safe_banner = html.escape(st.session_state.loaded_ticket_banner)
+    ticket_pill_html = f'<span class="pill pill-blue">🎫 {safe_banner}</span>'
 
-col1, col2 = st.columns([0.95, 1.05], gap="large")
+st.markdown(
+    f"""
+    <div class="workspace-header">
+        <h2 class="workspace-title">{header_icon}{html.escape(mode)}</h2>
+        {ticket_pill_html}
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+# ================= MAIN TWO-COLUMN LAYOUT =================
+col1, col2 = st.columns([0.92, 1.08], gap="large")
 
 with col1:
     verify_kb_in_refine = False
@@ -931,172 +1157,177 @@ with col1:
     agent_notes = ""
     customer_email = ""
 
-    # -------- GROOVE TICKET FETCHER BAR (Draft Reply & Internal Note) --------
+    # -------- COMPACT GROOVE TICKET FETCHER BAR --------
     if mode in ("Draft Reply", "Internal Note / Summary"):
-        g1, g2, g3 = st.columns([1.8, 1.15, 1.0], gap="small")
+        g1, g2, g3 = st.columns([2.2, 0.9, 0.8], gap="small")
         ticket_num_input = g1.text_input(
             "Groove Ticket #",
-            placeholder="Ticket # (e.g., 114201)",
+            placeholder="Groove Ticket # (e.g., 114430)",
             label_visibility="collapsed",
         )
         fetch_clicked = g2.button("📥 Fetch", use_container_width=True, help="Fetch full ticket thread from Groove")
         clear_clicked = g3.button("🧹 Clear", use_container_width=True, help="Clear loaded ticket fields")
-        
+
         if clear_clicked:
             st.session_state.customer_email_box = ""
             st.session_state.prev_replies_box = ""
             st.session_state.loaded_ticket_banner = ""
             st.rerun()
 
-        if fetch_clicked:
+        def _load_ticket_into_state(tkt_str: str, prefix: str = ""):
             active_bearer = st.session_state.groove_runtime_bearer.strip() or GROOVE_BEARER_TOKEN
-            with st.spinner(f"Fetching Ticket #{ticket_num_input} from Groove..."):
-                try:
-                    t_data = fetch_groove_ticket(
-                        ticket_input=ticket_num_input,
-                        groove_api_token=GROOVE_API_TOKEN,
-                        groove_bearer_token=active_bearer,
-                    )
-                    if mode == "Internal Note / Summary":
-                        st.session_state.customer_email_box = t_data["full_thread"]
-                        st.session_state.prev_replies_box = ""
-                    else:
-                        st.session_state.customer_email_box = t_data["latest_customer_email"]
-                        st.session_state.prev_replies_box = t_data["previous_thread"]
+            t_data = fetch_groove_ticket(
+                ticket_input=tkt_str,
+                groove_api_token=GROOVE_API_TOKEN,
+                groove_bearer_token=active_bearer,
+            )
+            if mode == "Internal Note / Summary":
+                st.session_state.customer_email_box = t_data["full_thread"]
+                st.session_state.prev_replies_box = ""
+            else:
+                st.session_state.customer_email_box = t_data["latest_customer_email"]
+                st.session_state.prev_replies_box = t_data["previous_thread"]
 
-                    subj_tag = f" — *{t_data['subject']}*" if t_data.get("subject") else ""
-                    st.session_state.loaded_ticket_banner = (
-                        f"Loaded **Ticket #{t_data['ticket_number']}**{subj_tag} "
-                        f"({t_data['message_count']} message(s) pulled from Groove)"
-                    )
+            subj = t_data.get("subject", "")
+            subj_short = f" — {subj[:38]}…" if len(subj) > 38 else (f" — {subj}" if subj else "")
+            st.session_state.loaded_ticket_banner = (
+                f"{prefix}Ticket #{t_data['ticket_number']}{subj_short} ({t_data['message_count']} msgs)"
+            )
+
+        if fetch_clicked:
+            with st.spinner(f"Fetching Ticket #{ticket_num_input}..."):
+                try:
+                    _load_ticket_into_state(ticket_num_input)
                     st.rerun()
                 except Exception as e:
                     st.error(f"Groove Fetch Error: {e}")
 
-        # Auto-fetch ticket if opened via the Groove 1-Click Bookmarklet
         if st.session_state.get("pending_groove_ticket"):
             auto_tkt = st.session_state.pop("pending_groove_ticket")
-            active_bearer = st.session_state.groove_runtime_bearer.strip() or GROOVE_BEARER_TOKEN
-            with st.spinner(f"Auto-loading Ticket #{auto_tkt} from Groove..."):
+            with st.spinner(f"Auto-loading Ticket #{auto_tkt}..."):
                 try:
-                    t_data = fetch_groove_ticket(
-                        ticket_input=auto_tkt,
-                        groove_api_token=GROOVE_API_TOKEN,
-                        groove_bearer_token=active_bearer,
-                    )
-                    if mode == "Internal Note / Summary":
-                        st.session_state.customer_email_box = t_data["full_thread"]
-                        st.session_state.prev_replies_box = ""
-                    else:
-                        st.session_state.customer_email_box = t_data["latest_customer_email"]
-                        st.session_state.prev_replies_box = t_data["previous_thread"]
-
-                    subj_tag = f" — *{t_data['subject']}*" if t_data.get("subject") else ""
-                    st.session_state.loaded_ticket_banner = (
-                        f"Auto-loaded **Ticket #{t_data['ticket_number']}**{subj_tag} "
-                        f"({t_data['message_count']} message(s) pulled from Groove)"
-                    )
+                    _load_ticket_into_state(auto_tkt)
                     st.rerun()
                 except Exception as e:
                     st.error(f"Groove Auto-Fetch Error: {e}")
 
-        if st.session_state.loaded_ticket_banner:
-            st.info(st.session_state.loaded_ticket_banner)
-
-    # -------- MODE-SPECIFIC INPUTS --------
+    # -------- MODE-SPECIFIC INPUTS (TABBED FOR CLEANLINESS) --------
     if mode == "Draft Reply":
-        customer_email = st.text_area(
-            "Paste Customer Email (or fetch by Ticket # above)",
-            key="customer_email_box",
-            height=210,
-            placeholder="Paste the full customer email from Groove here, or enter a Ticket # above...",
-        )
-        uploaded_files = st.file_uploader(
-            "📎 Attach Customer Media / Files (Optional: Photo, PDF, Excel, CSV)",
-            type=["png", "jpg", "jpeg", "webp", "pdf", "xlsx", "xls", "csv"],
-            accept_multiple_files=True,
-            help="Screenshots are read via Gemini Vision; Excel/CSV files are inspected locally for Sapaad upload errors.",
-        )
-        with st.expander(
-            "💬 Previous Replies / Already Tried (Optional)",
-            expanded=bool(st.session_state.prev_replies_box.strip()),
-        ):
-            previous_replies = st.text_area(
-                "Earlier thread messages or troubleshooting steps already tried",
-                key="prev_replies_box",
-                height=115,
-                placeholder="Auto-filled when fetching a Groove ticket, or paste earlier replies here...",
+        tab_email, tab_thread, tab_files = st.tabs(["✉️ Email", "💬 Previous Thread", "📎 Attachments"])
+
+        with tab_email:
+            customer_email = st.text_area(
+                "Customer Email",
+                key="customer_email_box",
+                height=210,
+                placeholder="Paste customer email here, or fetch by Ticket # above...",
             )
-        agent_notes = st.text_area(
-            "Agent Instructions / Key Points (Optional)",
-            height=95,
-            placeholder="e.g., Ask if they are using Android or iOS / Tell them we tried calling and need AnyDesk ID...",
-        )
+            agent_notes = st.text_area(
+                "Agent Instructions (Optional)",
+                height=82,
+                placeholder="e.g., Ask for AnyDesk ID / Tell them we tried calling / Keep it brief...",
+            )
+
+        with tab_thread:
+            previous_replies = st.text_area(
+                "Earlier thread messages or steps already tried",
+                key="prev_replies_box",
+                height=290,
+                placeholder="Auto-filled when fetching a Groove ticket, or paste earlier replies here so the AI never repeats tried steps...",
+            )
+
+        with tab_files:
+            uploaded_files = st.file_uploader(
+                "Attach Customer Media / Files (Photo, PDF, Excel, CSV)",
+                type=["png", "jpg", "jpeg", "webp", "pdf", "xlsx", "xls", "csv"],
+                accept_multiple_files=True,
+                help="Screenshots are read via Gemini Vision; Excel/CSV files are inspected locally for Sapaad upload errors.",
+            )
+
+        # Subtle context indicators so agent knows what's loaded across tabs
+        context_pills = []
+        if st.session_state.prev_replies_box.strip():
+            context_pills.append('<span class="pill pill-slate">💬 Thread context loaded</span>')
+        if uploaded_files:
+            context_pills.append(f'<span class="pill pill-slate">📎 {len(uploaded_files)} file(s) attached</span>')
+        if context_pills:
+            st.markdown(f'<div class="pill-row">{"".join(context_pills)}</div>', unsafe_allow_html=True)
+
         btn_label = "✨ Generate Reply"
 
     elif mode == "🌍 Arabic Translator":
         customer_email = st.text_area(
-            "Write or Paste Email to Translate to Arabic",
-            height=260,
-            placeholder="Paste an English email (or rough draft) here to translate into flawless Sapaad Arabic in one click...",
+            "English Email / Draft to Translate",
+            height=240,
+            placeholder="Paste an English email or rough draft to translate into flawless Sapaad Business Arabic...",
         )
         t_opt1, t_opt2 = st.columns(2)
         proofread_ar = t_opt1.checkbox(
-            "✨ 0-Mistake Proofread Pass",
+            "✨ 0-Mistake Proofread",
             value=True,
             help="Runs a 2nd Arabic linguistic QA pass to eliminate grammar, plural, or phrasing slips.",
         )
         include_groove_envelope = t_opt2.checkbox(
-            "Include Groove Greeting & Closing",
+            "Groove Greeting & Closing",
             value=True,
             help="Ensures السلام عليكم، and لا تترددوا بالتواصل معنا لأي مساعدة إضافية.",
         )
         agent_notes = st.text_area(
-            "Optional Tone / Extra Note",
-            height=75,
-            placeholder="e.g., Keep it extra warm and apologetic / Keep the product name in English...",
+            "Tone / Extra Note (Optional)",
+            height=72,
+            placeholder="e.g., Extra warm & apologetic / Keep product names in English...",
         )
         btn_label = "🌍 Translate to Arabic"
 
     elif mode == "Refine Draft":
         agent_notes = st.text_area(
-            "Your Rough Draft to Refine",
+            "Your Rough Draft",
             height=210,
             placeholder="Paste your rough draft here...",
         )
-        customer_email = st.text_area(
-            "Customer Email (Optional context)",
-            height=130,
-            placeholder="Optional: paste the customer's email so the AI checks tone & context...",
-        )
+        with st.expander("📩 Customer Email Context (Optional)", expanded=False):
+            customer_email = st.text_area(
+                "Customer Email",
+                height=130,
+                placeholder="Optional: paste the customer's email so the AI checks tone & context...",
+                label_visibility="collapsed",
+            )
         verify_kb_in_refine = st.checkbox(
-            "Verify technical Sapaad steps against KB & Tickets",
+            "Verify Sapaad steps against KB & Tickets",
             value=False,
         )
         btn_label = "✨ Refine Draft"
 
     elif mode == "FAQ / Template":
         customer_email = st.text_area(
-            "Topic / Scenario for Reusable Template",
-            height=210,
+            "Topic / Scenario",
+            height=205,
             placeholder="e.g., How to install Cloud Print Agent and find the API key...",
         )
-        agent_notes = st.text_area("Extra Requirements (Optional)", height=100)
+        agent_notes = st.text_area("Extra Requirements (Optional)", height=85)
         btn_label = "✨ Generate Template"
 
     else:
-        customer_email = st.text_area(
-            "Paste Ticket Thread or Fetch by Ticket # Above",
-            key="customer_email_box",
-            height=250,
-            placeholder="Paste the email/thread or fetch a Groove Ticket # above to summarize into an English internal note...",
-        )
-        uploaded_files = st.file_uploader(
-            "📎 Attach Files to Include in Summary (Optional)",
-            type=["png", "jpg", "jpeg", "webp", "pdf", "xlsx", "xls", "csv"],
-            accept_multiple_files=True,
-        )
-        agent_notes = st.text_area("Focus / Specific Question (Optional)", height=80)
+        tab_note_body, tab_note_files = st.tabs(["📝 Ticket Thread", "📎 Attachments"])
+        with tab_note_body:
+            customer_email = st.text_area(
+                "Ticket Thread or Foreign-Language Email",
+                key="customer_email_box",
+                height=230,
+                placeholder="Paste thread or fetch a Groove Ticket # above to summarize into an English internal note...",
+            )
+            agent_notes = st.text_area("Focus / Specific Question (Optional)", height=75)
+        with tab_note_files:
+            uploaded_files = st.file_uploader(
+                "Attach Files to Include in Summary",
+                type=["png", "jpg", "jpeg", "webp", "pdf", "xlsx", "xls", "csv"],
+                accept_multiple_files=True,
+            )
+        if uploaded_files:
+            st.markdown(
+                f'<div class="pill-row"><span class="pill pill-slate">📎 {len(uploaded_files)} file(s) attached</span></div>',
+                unsafe_allow_html=True,
+            )
         btn_label = "✨ Generate Internal Note"
 
     generate_btn = st.button(btn_label, type="primary", use_container_width=True)
@@ -1207,7 +1438,7 @@ with col2:
                     or (mode == "Refine Draft" and verify_kb_in_refine)
                 )
 
-                with st.spinner("Searching Sapaad KB & Tickets and generating..."):
+                with st.spinner("Searching Sapaad KB & Tickets and drafting..."):
                     if should_search:
                         matches, search_meta = _smart_retrieve_context(
                             index_bundle=index_bundle,
@@ -1318,70 +1549,105 @@ with col2:
                     except Exception as e:
                         st.error(f"API Error: {e}")
 
+    # ================= RIGHT PANEL OUTPUT =================
     if "last_output" in st.session_state:
-        st.subheader("Ready for Groove")
-
-        if st.session_state.get("last_agent_note"):
-            st.warning(f"**Internal Agent Note (not copied into email):** {st.session_state.last_agent_note}")
-
         audit = st.session_state.get("last_audit", {})
+        pii_count = st.session_state.get("last_pii_count", 0)
+
+        badges_html = []
+        if audit and not audit.get("errors"):
+            badges_html.append('<span class="pill pill-green">✅ Verified</span>')
+        if pii_count:
+            badges_html.append(f'<span class="pill pill-slate">🔒 {pii_count} PII Masked</span>')
+        if st.session_state.get("last_attachment_labels"):
+            badges_html.append(
+                f'<span class="pill pill-slate">📎 {len(st.session_state.last_attachment_labels)} File(s)</span>'
+            )
+
+        st.markdown(
+            f"""
+            <div class="panel-header-row">
+                <p class="panel-title">Ready for Groove</p>
+                <div style="display:flex; gap:6px; flex-wrap:wrap;">{"".join(badges_html)}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        # Prominent red alert ONLY if an actual audit error occurred
         if audit.get("errors"):
             for err in audit["errors"]:
                 st.error(f"🚨 **Audit Alert:** {err}")
-        elif audit:
-            pii_count = st.session_state.get("last_pii_count", 0)
-            pii_tag = f" • 🔒 {pii_count} PII item(s) masked" if pii_count else ""
-            st.success(f"✅ **Audit Passed:** Menu paths verified • Zero leaks • Groove format valid{pii_tag}")
 
-        if audit.get("auto_fixes"):
-            st.caption("🛠️ **Auto-repaired:** " + " • ".join(audit["auto_fixes"]))
+        # Sleek compact callout for Internal Agent Note
+        if st.session_state.get("last_agent_note"):
+            safe_note = html.escape(st.session_state.last_agent_note)
+            st.markdown(
+                f'<div class="agent-note-box"><strong>Agent Note (not copied):</strong> {safe_note}</div>',
+                unsafe_allow_html=True,
+            )
 
-        if st.session_state.get("last_attachment_labels"):
-            st.caption("📎 **Attachments Analyzed:** " + " • ".join(st.session_state.last_attachment_labels))
-
+        # Integrated Preview & Copy Card
         render_groove_preview_and_copy(st.session_state.last_output)
 
+        # Compact 1-Row Quick Refinements Bar
         st.markdown('<div class="quick-actions-label">⚡ Quick Refinements</div>', unsafe_allow_html=True)
-        r1c1, r1c2, r1c3 = st.columns(3, gap="small")
-        if r1c1.button("✂️ Shorten", use_container_width=True, help="Make the reply shorter and easier to scan"):
+        q1, q2, q3, q4, q5 = st.columns(5, gap="small")
+        if q1.button("✂️ Shorten", use_container_width=True, help="Make the reply shorter and easier to scan"):
             apply_quick_action("shorten", selected_model_pair)
             st.rerun()
-        if r1c2.button("🤝 De-escalate", use_container_width=True, help="Add calm empathy for an upset customer"):
+        if q2.button("🤝 Empathize", use_container_width=True, help="Add warm empathy and calm de-escalation"):
             apply_quick_action("deescalate", selected_model_pair)
             st.rerun()
-        if r1c3.button("🖥️ + AnyDesk", use_container_width=True, help="Append a polite AnyDesk remote support request"):
+        if q3.button("🖥️ +AnyDesk", use_container_width=True, help="Append a polite AnyDesk remote support request"):
             apply_quick_action("anydesk", selected_model_pair)
             st.rerun()
-
-        r2c1, r2c2 = st.columns(2, gap="small")
-        if r2c1.button("🌐 Switch EN ↔ AR", use_container_width=True, help="Translate draft between English and Arabic"):
+        if q4.button("🌐 EN↔AR", use_container_width=True, help="Switch draft between English and Arabic"):
             apply_quick_action("translate", selected_model_pair)
             st.rerun()
-        if r2c2.button("📝 Convert to Internal Note", use_container_width=True, help="Summarize into an English Groove internal note"):
+        if q5.button("📝 Note", use_container_width=True, help="Convert into an English Groove internal note"):
             apply_quick_action("internal_note", selected_model_pair)
             st.rerun()
 
-        meta = st.session_state.get("last_search_meta", {})
-        engine_caption = f" | Search: `{meta.get('engine')}` | Grounding: `{meta.get('confidence')}`" if meta else ""
-        st.caption(f"Model used: `{st.session_state.last_model}`{engine_caption}")
+        # Consolidated Sources & Diagnostics Expander
+        matches_list = st.session_state.get("last_matches") or []
+        meta = st.session_state.get("last_search_meta") or {}
+        diag_label = f"📚 Sources & Diagnostics ({len(matches_list)})" if matches_list else "🔍 Run Diagnostics"
 
-        if st.session_state.get("last_attachment_summary"):
-            with st.expander("📎 View Extracted Attachment Details"):
-                st.text(st.session_state.last_attachment_summary)
+        with st.expander(diag_label, expanded=False):
+            engine_txt = f" • **Search:** `{meta.get('engine')}` • **Grounding:** `{meta.get('confidence')}`" if meta else ""
+            st.caption(f"**Model:** `{st.session_state.last_model}`{engine_txt}")
 
-        if st.session_state.get("last_matches"):
-            with st.expander(f"📚 Referenced Sources ({len(st.session_state.last_matches)})"):
-                if meta:
-                    cf_err_note = f"\n\n⚠️ **Cloudflare Hybrid Note:** `{meta['cf_error']}`" if meta.get("cf_error") else ""
-                    st.info(
-                        f"**Engine:** {meta.get('engine')} | "
-                        f"**Grounding Confidence:** {meta.get('confidence')} "
-                        f"(BM25: {meta.get('top_bm25', 0)}, Cosine: {meta.get('top_cosine', 0)})\n\n"
-                        f"**Queries:** {' | '.join(meta.get('queries', []))}{cf_err_note}"
-                    )
-                for m in st.session_state.last_matches:
-                    matched_tag = f" — *matched: {m['matched_query']}*" if m.get("matched_query") else ""
-                    st.markdown(f"**[{m['type']}] {m['title']}** *({m['source']})*{matched_tag}")
-                    st.caption(m["text"][:450] + ("..." if len(m["text"]) > 450 else ""))
-                    st.divider()
+            if audit.get("auto_fixes"):
+                st.caption("🛠️ **Auto-repaired:** " + " • ".join(audit["auto_fixes"]))
 
+            if st.session_state.get("last_attachment_summary"):
+                st.markdown("**📎 Extracted Attachment Details**")
+                st.code(st.session_state.last_attachment_summary, language=None)
+
+            if meta:
+                cf_err_note = f"\n\n⚠️ **Cloudflare Hybrid Note:** `{meta['cf_error']}`" if meta.get("cf_error") else ""
+                st.info(
+                    f"**BM25:** {meta.get('top_bm25', 0)} | **Cosine:** {meta.get('top_cosine', 0)}\n\n"
+                    f"**Queries:** {' | '.join(meta.get('queries', []))}{cf_err_note}"
+                )
+
+            for m in matches_list:
+                matched_tag = f" — *matched: {m['matched_query']}*" if m.get("matched_query") else ""
+                st.markdown(f"**[{m['type']}] {m['title']}** *({m['source']})*{matched_tag}")
+                st.caption(m["text"][:420] + ("..." if len(m["text"]) > 420 else ""))
+                st.divider()
+    else:
+        st.markdown(
+            """
+            <div class="empty-state">
+                <div style="font-size: 1.8rem;">✨</div>
+                <h4>Ready when you are</h4>
+                <p>
+                    Fetch a Groove ticket or paste a customer email on the left, add optional instructions or files,
+                    and click <strong>Generate</strong> to get a verified, Groove-ready reply.
+                </p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
