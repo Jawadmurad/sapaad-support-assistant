@@ -886,12 +886,12 @@ with st.sidebar:
         else:
             st.info("Click your **✨ Sapaad AI** bookmark while on Groove to connect automatically.")
         runtime_tok = st.text_input(
-            "Manual Session Bearer Token (Optional)",
-            value=st.session_state.groove_runtime_bearer,
-            type="password",
-            placeholder="Auto-filled by bookmarklet...",
-            help="Filled automatically by the Groove bookmarklet, or paste manually if needed.",
-        )
+             "Manual Session Bearer Token (Optional)",
+             key="groove_runtime_bearer",
+             type="password",
+             placeholder="Auto-filled by bookmarklet...",
+             help="Filled automatically by the Groove bookmarklet, or paste manually if needed.",
+         )
         st.session_state.groove_runtime_bearer = runtime_tok
 
     if index_bundle.get("docs"):
@@ -1385,3 +1385,4 @@ with col2:
                     st.markdown(f"**[{m['type']}] {m['title']}** *({m['source']})*{matched_tag}")
                     st.caption(m["text"][:450] + ("..." if len(m["text"]) > 450 else ""))
                     st.divider()
+
