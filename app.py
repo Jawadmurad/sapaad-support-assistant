@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import hmac
 import html
@@ -292,6 +293,17 @@ def verify_auth_token(token: str, password: str) -> bool:
         return hmac.compare_digest(sig, expected)
     except Exception:
         return False
+
+
+def _emit_ext_bridge(payload: dict):
+    """Render a hidden Base64-encoded JSON node so the Groove Chrome/Edge extension can read the draft inline."""
+    if not payload or not payload.get("reqId"):
+        return
+    encoded = base64.b64encode(json.dumps(payload, ensure_ascii=False).encode("utf-8")).decode("ascii")
+    st.markdown(
+        f'<div id="sapaad-ext-bridge" style="display:none !important;">{encoded}</div>',
+        unsafe_allow_html=True,
+    )
 
 
 def build_budgeted_context(matches: list[dict], customer_email: str, agent_notes: str, language: str) -> str:
@@ -1000,14 +1012,21 @@ st.session_state.setdefault("pending_groove_notes", "")
 st.session_state.setdefault("pending_auto_generate", False)
 st.session_state.setdefault("trigger_auto_generate", False)
 st.session_state.setdefault("workspace_mode", "Draft Reply")
+st.session_state.setdefault("pending_ext_reqid", "")
+st.session_state.setdefault("last_ext_bridge_payload", None)
 
-if any(k in st.query_params for k in ("gtoken", "ticket", "mids", "sel", "notes", "autogen")):
+if any(k in st.query_params for k in ("gtoken", "ticket", "mids", "sel", "notes", "autogen", "reqid")):
     incoming_tok = str(st.query_params.get("gtoken", "")).strip()
     incoming_tkt = str(st.query_params.get("ticket", "")).strip()
     incoming_mids = str(st.query_params.get("mids", "")).strip()
     incoming_sel = str(st.query_params.get("sel", "")).strip()
     incoming_notes = str(st.query_params.get("notes", "")).strip()
     incoming_autogen = str(st.query_params.get("autogen", "")).strip()
+    incoming_reqid = str(st.query_params.get("reqid", "")).strip()
+
+    if incoming_reqid:
+        st.session_state.pending_ext_reqid = incoming_reqid
+        st.session_state.last_ext_bridge_payload = None
 
     if incoming_tok:
         st.session_state.groove_runtime_bearer = incoming_tok
@@ -1110,6 +1129,11 @@ if TEAM_PASSWORD:
                         st.rerun()
                     else:
                         st.error("Incorrect password.")
+        if all_cookies is not None and st.session_state.get("pending_ext_reqid"):
+            _emit_ext_bridge({
+                "reqId": st.session_state.pending_ext_reqid,
+                "status": "login_required",
+            })
         st.stop()
 
 if cookie_ctrl and not st.session_state.get("pending_groove_ticket"):
@@ -1368,6 +1392,12 @@ with col1:
                     st.rerun()
                 except Exception as e:
                     st.error(f"Groove Auto-Fetch Error: {e}")
+                    if st.session_state.get("pending_ext_reqid"):
+                        st.session_state.last_ext_bridge_payload = {
+                            "reqId": st.session_state.pop("pending_ext_reqid"),
+                            "status": "error",
+                            "errorMessage": f"Groove Auto-Fetch Error: {e}",
+                        }
 
     # -------- MODE-SPECIFIC INPUTS (TABBED FOR CLEANLINESS) --------
     if mode == "Draft Reply":
@@ -1706,8 +1736,28 @@ with col2:
                         st.session_state.last_context_block = context_block
                         st.session_state.last_customer_email = customer_email
                         st.session_state.last_agent_notes = agent_notes
+                        if st.session_state.get("pending_ext_reqid"):
+                            _g_html, _p_txt, _is_rtl = markdown_to_groove_html(final_draft)
+                            st.session_state.last_ext_bridge_payload = {
+                                "reqId": st.session_state.pop("pending_ext_reqid"),
+                                "status": "ready",
+                                "draftText": final_draft,
+                                "grooveHtml": _g_html,
+                                "plainText": _p_txt,
+                                "isRtl": _is_rtl,
+                                "agentNote": final_agent_note,
+                                "auditErrors": audit_report.get("errors", []),
+                                "model": used_model,
+                                "ticketBanner": st.session_state.get("loaded_ticket_banner", ""),
+                            }
                     except Exception as e:
                         st.error(f"API Error: {e}")
+                        if st.session_state.get("pending_ext_reqid"):
+                            st.session_state.last_ext_bridge_payload = {
+                                "reqId": st.session_state.pop("pending_ext_reqid"),
+                                "status": "error",
+                                "errorMessage": f"API Error: {e}",
+                            }
 
     # ================= RIGHT PANEL OUTPUT =================
     if "last_output" in st.session_state:
@@ -1811,3 +1861,7 @@ with col2:
             """,
             unsafe_allow_html=True,
         )
+
+
+if st.session_state.get("last_ext_bridge_payload"):
+    _emit_ext_bridge(st.session_state.last_ext_bridge_payload)
