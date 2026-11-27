@@ -6,3 +6,4 @@ numpy
 pypdf
 openpyxl
 beautifulsoup4
+streamlit-cookies-controller>=0.0.4

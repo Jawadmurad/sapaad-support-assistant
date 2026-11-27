@@ -148,13 +148,18 @@ def _gql_post(token: str, query_name: str, payload: dict) -> dict:
     except urllib.error.HTTPError as e:
         if e.code == 401:
             raise RuntimeError(
-                "Groove session token expired (HTTP 401). Click your ✨ Sapaad AI bookmarklet on Groove to refresh."
+                "Groove session token expired (HTTP 401). Open Groove or click your ✨ Sapaad AI bookmark/extension to refresh."
             ) from e
         err_body = e.read().decode("utf-8", errors="ignore")[:250]
         raise RuntimeError(f"Groove GraphQL HTTP {e.code}: {err_body}") from e
 
 
-def _fetch_via_graphql(ticket_num: str, bearer_token: str) -> dict:
+def _fetch_via_graphql(
+    ticket_num: str,
+    bearer_token: str,
+    selected_ids: list[str] | None = None,
+    selected_indices: list[int] | None = None,
+) -> dict:
     conv_id = f"cnv_{ticket_num}"
     subject = ""
     customer_name = ""
@@ -219,6 +224,7 @@ def _fetch_via_graphql(ticket_num: str, bearer_token: str) -> dict:
                     )
                     if body_clean:
                         batch.append({
+                            "id": str(change.get("id") or grp_summary.get("id") or ""),
                             "role": role,
                             "author": author_name,
                             "created_at": (change.get("createdAt") or ev.get("createdAt") or "")[:16].replace("T", " "),
@@ -233,6 +239,7 @@ def _fetch_via_graphql(ticket_num: str, bearer_token: str) -> dict:
                 )
                 if body_clean:
                     batch.append({
+                        "id": str(grp_summary.get("id") or ""),
                         "role": role,
                         "author": author_name,
                         "created_at": (grp_summary.get("createdAt") or "")[:16].replace("T", " "),
@@ -246,7 +253,15 @@ def _fetch_via_graphql(ticket_num: str, bearer_token: str) -> dict:
         else:
             break
 
-    return _package_ticket(ticket_num, subject, customer_name, state, all_messages)
+    return _package_ticket(
+        ticket_num,
+        subject,
+        customer_name,
+        state,
+        all_messages,
+        selected_ids=selected_ids,
+        selected_indices=selected_indices,
+    )
 
 
 def _rest_get(api_token: str, path: str) -> dict:
@@ -271,7 +286,12 @@ def _rest_get(api_token: str, path: str) -> dict:
         raise RuntimeError(f"Groove REST HTTP {e.code}: {err_body}") from e
 
 
-def _fetch_via_rest_v1(ticket_num: str, api_token: str) -> dict:
+def _fetch_via_rest_v1(
+    ticket_num: str,
+    api_token: str,
+    selected_ids: list[str] | None = None,
+    selected_indices: list[int] | None = None,
+) -> dict:
     t_data = _rest_get(api_token, f"/tickets/{ticket_num}")
     ticket = t_data.get("ticket") or {}
     subject = ticket.get("title") or ticket.get("subject") or ""
@@ -292,13 +312,22 @@ def _fetch_via_rest_v1(ticket_num: str, api_token: str) -> dict:
         )
         if body_clean:
             messages.append({
+                "id": str(m.get("id") or ""),
                 "role": role,
                 "author": "",
                 "created_at": (m.get("created_at") or "")[:16].replace("T", " "),
                 "text": body_clean,
             })
 
-    return _package_ticket(ticket_num, subject, "", state, messages)
+    return _package_ticket(
+        ticket_num,
+        subject,
+        "",
+        state,
+        messages,
+        selected_ids=selected_ids,
+        selected_indices=selected_indices,
+    )
 
 
 def _package_ticket(
@@ -307,25 +336,47 @@ def _package_ticket(
     customer_name: str,
     state: str,
     messages: list[dict],
+    selected_ids: list[str] | None = None,
+    selected_indices: list[int] | None = None,
 ) -> dict:
     if not messages:
         raise RuntimeError(
             f"Ticket #{ticket_num} returned 0 messages. Check the ticket number and your Groove token."
         )
 
-    public_msgs = [m for m in messages if m["role"] in ("customer", "agent")]
-    if not public_msgs:
-        public_msgs = messages
+    total_message_count = len(messages)
+    filtered_messages = messages
+    explicit_selection = False
+
+    if selected_ids:
+        id_set = {s.strip() for s in selected_ids if s.strip()}
+        matched = [m for m in messages if m.get("id") and m["id"] in id_set]
+        if matched:
+            filtered_messages = matched
+            explicit_selection = len(matched) < total_message_count
+    elif selected_indices is not None:
+        idx_set = {i for i in selected_indices if 0 <= i < total_message_count}
+        matched = [messages[i] for i in sorted(idx_set)]
+        if matched:
+            filtered_messages = matched
+            explicit_selection = len(matched) < total_message_count
+
+    if explicit_selection:
+        draft_msgs = filtered_messages
+    else:
+        draft_msgs = [m for m in filtered_messages if m["role"] in ("customer", "agent")]
+        if not draft_msgs:
+            draft_msgs = filtered_messages
 
     latest_cust_idx = None
-    for idx in range(len(public_msgs) - 1, -1, -1):
-        if public_msgs[idx]["role"] == "customer":
+    for idx in range(len(draft_msgs) - 1, -1, -1):
+        if draft_msgs[idx]["role"] == "customer":
             latest_cust_idx = idx
             break
     if latest_cust_idx is None:
-        latest_cust_idx = len(public_msgs) - 1
+        latest_cust_idx = len(draft_msgs) - 1
 
-    latest_msg = public_msgs[latest_cust_idx]
+    latest_msg = draft_msgs[latest_cust_idx]
     header_parts = [f"Ticket #{ticket_num}"]
     if subject:
         header_parts.append(f"Subject: {subject}")
@@ -336,17 +387,21 @@ def _package_ticket(
     latest_customer_email = f"{header_line}\n\n{latest_msg['text']}"
 
     earlier_blocks = []
-    for idx, m in enumerate(public_msgs):
+    for idx, m in enumerate(draft_msgs):
         if idx == latest_cust_idx:
             continue
-        base_who = "Customer" if m["role"] == "customer" else "Sapaad Agent"
+        base_who = {"customer": "Customer", "agent": "Sapaad Agent", "note": "Internal Note"}.get(
+            m["role"], "Message"
+        )
         who = f"{base_who} ({m['author']})" if m.get("author") else base_who
         earlier_blocks.append(f"[{who} — {m['created_at']}]\n{m['text']}")
     previous_thread = "\n\n---\n\n".join(earlier_blocks)
 
     full_blocks = [header_line]
-    for m in messages:
-        base_who = {"customer": "Customer", "agent": "Sapaad Agent", "note": "Internal Note"}.get(m["role"], "Message")
+    for m in filtered_messages:
+        base_who = {"customer": "Customer", "agent": "Sapaad Agent", "note": "Internal Note"}.get(
+            m["role"], "Message"
+        )
         who = f"{base_who} ({m['author']})" if m.get("author") else base_who
         full_blocks.append(f"[{who} — {m['created_at']}]\n{m['text']}")
     full_thread = "\n\n---\n\n".join(full_blocks)
@@ -356,7 +411,9 @@ def _package_ticket(
         "subject": subject,
         "customer_name": customer_name,
         "state": state,
-        "message_count": len(messages),
+        "message_count": len(filtered_messages),
+        "total_message_count": total_message_count,
+        "selected_subset": explicit_selection,
         "latest_customer_email": latest_customer_email,
         "previous_thread": previous_thread,
         "full_thread": full_thread,
@@ -367,6 +424,8 @@ def fetch_groove_ticket(
     ticket_input: str,
     groove_api_token: str = "",
     groove_bearer_token: str = "",
+    selected_ids: list[str] | None = None,
+    selected_indices: list[int] | None = None,
 ) -> dict:
     """Fetch a full Groove ticket by ticket number using REST v1 (permanent token) or GraphQL v2 (Bearer token)."""
     num_match = re.search(r"\d+", str(ticket_input or ""))
@@ -375,10 +434,10 @@ def fetch_groove_ticket(
     ticket_num = num_match.group(0)
 
     if groove_api_token.strip():
-        return _fetch_via_rest_v1(ticket_num, groove_api_token)
+        return _fetch_via_rest_v1(ticket_num, groove_api_token, selected_ids=selected_ids, selected_indices=selected_indices)
     if groove_bearer_token.strip():
-        return _fetch_via_graphql(ticket_num, groove_bearer_token)
+        return _fetch_via_graphql(ticket_num, groove_bearer_token, selected_ids=selected_ids, selected_indices=selected_indices)
 
     raise RuntimeError(
-        "No Groove token configured. Click your ✨ Sapaad AI bookmark while on Groove to connect automatically."
+        "No Groove token configured. Open Groove with the extension or click your ✨ Sapaad AI bookmark to connect automatically."
     )

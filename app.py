@@ -1,13 +1,21 @@
+import hashlib
+import hmac
 import html
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.request
 
 import streamlit as st
 import streamlit.components.v1 as components
 from groq import Groq
+
+try:
+    from streamlit_cookies_controller import CookieController
+except ImportError:
+    CookieController = None
 
 from attachments import analyze_uploaded_files
 from groove_client import fetch_groove_ticket
@@ -257,6 +265,33 @@ GROOVE_BEARER_TOKEN = get_secret("GROOVE_BEARER_TOKEN")
 LOCAL_DATA_DIR = "data"
 
 MAX_CONTEXT_CHARS = 10800
+
+AUTH_COOKIE_NAME = "sapaad_auth_v1"
+GTOKEN_COOKIE_NAME = "sapaad_gtoken_v1"
+REMEMBER_DAYS = 30
+
+
+# ================= SIGNED SESSION COOKIE HELPERS =================
+def create_auth_token(password: str, ttl_seconds: int) -> str:
+    exp = int(time.time()) + ttl_seconds
+    payload = f"sapaad_team:{exp}"
+    sig = hmac.new(password.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"{exp}.{sig}"
+
+
+def verify_auth_token(token: str, password: str) -> bool:
+    if not token or not password or "." not in str(token):
+        return False
+    try:
+        exp_str, sig = str(token).split(".", 1)
+        exp = int(exp_str)
+        if exp < int(time.time()):
+            return False
+        payload = f"sapaad_team:{exp}"
+        expected = hmac.new(password.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+        return hmac.compare_digest(sig, expected)
+    except Exception:
+        return False
 
 
 def build_budgeted_context(matches: list[dict], customer_email: str, agent_notes: str, language: str) -> str:
@@ -954,24 +989,77 @@ def apply_quick_action(action_key: str, selected_pair: tuple[str, str]):
         st.session_state.last_model = used_model
 
 
-# ================= BOOKMARKLET HANDSHAKE (AUTO-CONNECT GROOVE) =================
+# ================= COOKIE CONTROLLER & HANDSHAKE =================
+cookie_ctrl = CookieController(key="sapaad_cookie_ctrl") if CookieController else None
+
 st.session_state.setdefault("groove_runtime_bearer", "")
 st.session_state.setdefault("pending_groove_ticket", "")
+st.session_state.setdefault("pending_groove_mids", [])
+st.session_state.setdefault("pending_groove_sel", None)
+st.session_state.setdefault("pending_groove_notes", "")
+st.session_state.setdefault("pending_auto_generate", False)
+st.session_state.setdefault("trigger_auto_generate", False)
+st.session_state.setdefault("workspace_mode", "Draft Reply")
 
-if "gtoken" in st.query_params or "ticket" in st.query_params:
+if any(k in st.query_params for k in ("gtoken", "ticket", "mids", "sel", "notes", "autogen")):
     incoming_tok = str(st.query_params.get("gtoken", "")).strip()
     incoming_tkt = str(st.query_params.get("ticket", "")).strip()
+    incoming_mids = str(st.query_params.get("mids", "")).strip()
+    incoming_sel = str(st.query_params.get("sel", "")).strip()
+    incoming_notes = str(st.query_params.get("notes", "")).strip()
+    incoming_autogen = str(st.query_params.get("autogen", "")).strip()
+
     if incoming_tok:
         st.session_state.groove_runtime_bearer = incoming_tok
+        st.session_state._pending_gtoken_cookie = incoming_tok
     if incoming_tkt:
         st.session_state.pending_groove_ticket = incoming_tkt
+        if incoming_mids and incoming_mids.lower() != "all":
+            st.session_state.pending_groove_mids = [x.strip() for x in incoming_mids.split(",") if x.strip()]
+        else:
+            st.session_state.pending_groove_mids = []
+
+        if incoming_sel and incoming_sel.lower() != "all":
+            parsed_idx = [int(p.strip()) for p in incoming_sel.split(",") if p.strip().isdigit()]
+            st.session_state.pending_groove_sel = parsed_idx if parsed_idx else None
+        else:
+            st.session_state.pending_groove_sel = None
+
+        st.session_state.pending_groove_notes = incoming_notes
+        st.session_state.pending_auto_generate = incoming_autogen == "1"
+        if incoming_autogen == "1":
+            st.session_state.workspace_mode = "Draft Reply"
+    elif incoming_notes:
+        st.session_state.pending_groove_notes = incoming_notes
+
     st.query_params.clear()
 
+all_cookies = cookie_ctrl.getAll() if cookie_ctrl else {}
 
-# ================= PASSWORD GATE =================
+if isinstance(all_cookies, dict) and not st.session_state.groove_runtime_bearer:
+    saved_gtok = all_cookies.get(GTOKEN_COOKIE_NAME)
+    if saved_gtok and isinstance(saved_gtok, str) and saved_gtok.strip():
+        st.session_state.groove_runtime_bearer = saved_gtok.strip()
+
+if cookie_ctrl and st.session_state.pop("_pending_cookie_clear", False):
+    try:
+        cookie_ctrl.remove(AUTH_COOKIE_NAME, path="/")
+    except Exception:
+        pass
+    try:
+        cookie_ctrl.remove(GTOKEN_COOKIE_NAME, path="/")
+    except Exception:
+        pass
+
+
+# ================= PASSWORD GATE WITH PERSISTENT COOKIE =================
 if TEAM_PASSWORD:
-    if "authenticated" not in st.session_state:
-        st.session_state.authenticated = False
+    st.session_state.setdefault("authenticated", False)
+
+    if not st.session_state.authenticated and isinstance(all_cookies, dict):
+        saved_auth = all_cookies.get(AUTH_COOKIE_NAME, "")
+        if verify_auth_token(saved_auth, TEAM_PASSWORD):
+            st.session_state.authenticated = True
 
     if not st.session_state.authenticated:
         st.markdown(
@@ -989,6 +1077,8 @@ if TEAM_PASSWORD:
         _, center_col, _ = st.columns([1, 1.2, 1])
         with center_col:
             st.markdown("### 🔒 Sapaad Support AI")
+            if all_cookies is None and cookie_ctrl is not None:
+                st.caption("Checking saved login session...")
             if st.session_state.get("pending_groove_ticket"):
                 st.info(
                     f"🔗 Groove Ticket **#{st.session_state.pending_groove_ticket}** queued — "
@@ -1002,19 +1092,57 @@ if TEAM_PASSWORD:
                     autocomplete="current-password",
                     placeholder="Enter team password...",
                 )
+                remember_me = st.checkbox(
+                    f"Remember me for {REMEMBER_DAYS} days",
+                    value=True,
+                    help="Stays logged in across tab closures, inactivity, and Groove bookmark/extension clicks.",
+                )
                 submitted = st.form_submit_button("Login", type="primary", use_container_width=True)
                 if submitted:
                     if pwd == TEAM_PASSWORD:
+                        ttl = REMEMBER_DAYS * 86400 if remember_me else 12 * 3600
+                        token = create_auth_token(TEAM_PASSWORD, ttl)
                         st.session_state.authenticated = True
+                        st.session_state._pending_cookie_set = (
+                            token,
+                            (REMEMBER_DAYS * 86400) if remember_me else None,
+                        )
                         st.rerun()
                     else:
                         st.error("Incorrect password.")
         st.stop()
 
+if cookie_ctrl and not st.session_state.get("pending_groove_ticket"):
+    if st.session_state.get("_pending_cookie_set"):
+        auth_tok, auth_max_age = st.session_state.pop("_pending_cookie_set")
+        try:
+            cookie_ctrl.set(
+                AUTH_COOKIE_NAME,
+                auth_tok,
+                max_age=auth_max_age,
+                path="/",
+                same_site="lax",
+            )
+        except Exception:
+            pass
+    if st.session_state.get("_pending_gtoken_cookie"):
+        gtok_val = st.session_state.pop("_pending_gtoken_cookie")
+        try:
+            cookie_ctrl.set(
+                GTOKEN_COOKIE_NAME,
+                gtok_val,
+                max_age=12 * 3600,
+                path="/",
+                same_site="lax",
+            )
+        except Exception:
+            pass
+
 
 # ================= SESSION STATE INIT =================
 st.session_state.setdefault("customer_email_box", "")
 st.session_state.setdefault("prev_replies_box", "")
+st.session_state.setdefault("agent_notes_box", "")
 st.session_state.setdefault("loaded_ticket_banner", "")
 st.session_state.setdefault("attachment_cache", {})
 
@@ -1054,7 +1182,7 @@ with st.sidebar:
             "FAQ / Template",
             "Internal Note / Summary",
         ],
-        index=0,
+        key="workspace_mode",
         label_visibility="collapsed",
     )
 
@@ -1128,6 +1256,13 @@ with st.sidebar:
     else:
         st.warning("No `.md` files found in `./data` or `HF_DATASET_REPO`.")
 
+    if TEAM_PASSWORD:
+        st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
+        if st.button("🚪 Logout", use_container_width=True):
+            st.session_state.authenticated = False
+            st.session_state._pending_cookie_clear = True
+            st.rerun()
+
 # ================= WORKSPACE HEADER =================
 header_icon = "" if mode.startswith("🌍") else "📩 "
 ticket_pill_html = ""
@@ -1171,15 +1306,22 @@ with col1:
         if clear_clicked:
             st.session_state.customer_email_box = ""
             st.session_state.prev_replies_box = ""
+            st.session_state.agent_notes_box = ""
             st.session_state.loaded_ticket_banner = ""
             st.rerun()
 
-        def _load_ticket_into_state(tkt_str: str, prefix: str = ""):
+        def _load_ticket_into_state(
+            tkt_str: str,
+            selected_ids: list[str] | None = None,
+            selected_indices: list[int] | None = None,
+        ):
             active_bearer = st.session_state.groove_runtime_bearer.strip() or GROOVE_BEARER_TOKEN
             t_data = fetch_groove_ticket(
                 ticket_input=tkt_str,
                 groove_api_token=GROOVE_API_TOKEN,
                 groove_bearer_token=active_bearer,
+                selected_ids=selected_ids,
+                selected_indices=selected_indices,
             )
             if mode == "Internal Note / Summary":
                 st.session_state.customer_email_box = t_data["full_thread"]
@@ -1190,8 +1332,12 @@ with col1:
 
             subj = t_data.get("subject", "")
             subj_short = f" — {subj[:38]}…" if len(subj) > 38 else (f" — {subj}" if subj else "")
+            if t_data.get("selected_subset"):
+                cnt_txt = f"{t_data['message_count']}/{t_data['total_message_count']} msgs selected"
+            else:
+                cnt_txt = f"{t_data['message_count']} msgs"
             st.session_state.loaded_ticket_banner = (
-                f"{prefix}Ticket #{t_data['ticket_number']}{subj_short} ({t_data['message_count']} msgs)"
+                f"Ticket #{t_data['ticket_number']}{subj_short} ({cnt_txt})"
             )
 
         if fetch_clicked:
@@ -1204,9 +1350,21 @@ with col1:
 
         if st.session_state.get("pending_groove_ticket"):
             auto_tkt = st.session_state.pop("pending_groove_ticket")
+            auto_mids = st.session_state.pop("pending_groove_mids", [])
+            auto_sel = st.session_state.pop("pending_groove_sel", None)
+            auto_notes = st.session_state.pop("pending_groove_notes", "")
+            auto_gen = st.session_state.pop("pending_auto_generate", False)
+
             with st.spinner(f"Auto-loading Ticket #{auto_tkt}..."):
                 try:
-                    _load_ticket_into_state(auto_tkt)
+                    _load_ticket_into_state(
+                        auto_tkt,
+                        selected_ids=auto_mids or None,
+                        selected_indices=auto_sel,
+                    )
+                    st.session_state.agent_notes_box = auto_notes
+                    if auto_gen:
+                        st.session_state.trigger_auto_generate = True
                     st.rerun()
                 except Exception as e:
                     st.error(f"Groove Auto-Fetch Error: {e}")
@@ -1224,6 +1382,7 @@ with col1:
             )
             agent_notes = st.text_area(
                 "Agent Instructions (Optional)",
+                key="agent_notes_box",
                 height=82,
                 placeholder="e.g., Ask for AnyDesk ID / Tell them we tried calling / Keep it brief...",
             )
@@ -1335,7 +1494,8 @@ with col1:
 with col2:
     selected_model_pair = available_models[model_label]
 
-    if generate_btn:
+    should_generate = generate_btn or st.session_state.pop("trigger_auto_generate", False)
+    if should_generate:
         attachment_summary, attachment_labels = ("", [])
         if uploaded_files:
             with st.spinner("Analyzing attached media / files..."):
